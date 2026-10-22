@@ -111,12 +111,24 @@
 
 
 
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('DAISEI')
+    .addItem('Ouvrir l\'assistant', 'showSidebar')
+    .addToUi();
+}
+
+function showSidebar() {
+  const html = HtmlService.createHtmlOutputFromFile('Sidebar')
+    .setTitle('Assistant DAISEI');
+  SpreadsheetApp.getUi().showSidebar(html);
+}
+
 function getSheetRows(colLetter) {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) return [];
 
-  // Convertit la lettre (ex: 'A') en numéro de colonne
   const colIndex = sheet.getRange(colLetter + "1").getColumn();
   const values = sheet.getRange(2, colIndex, lastRow - 1, 1).getValues();
 
