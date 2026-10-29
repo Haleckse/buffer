@@ -6,7 +6,7 @@ function doGet() {
 
 const INDEX_FILE_NAME = "daisei_vector_index.json";
 
-// 1. Liste les fichiers du dossier (hors fichier d'index)
+// 1. Liste les fichiers du dossier avec leur taille
 function getFolderFileList(folderId) {
   if (!folderId) return { error: "ID de dossier manquant." };
 
@@ -19,8 +19,10 @@ function getFolderFileList(folderId) {
       const file = files.next();
       const name = file.getName();
       const mime = file.getMimeType();
+      const sizeMB = file.getSize() / (1024 * 1024);
 
-      if (name === INDEX_FILE_NAME) continue;
+      // Ignore les fichiers d'index sauvegardés
+      if (name === INDEX_FILE_NAME || name.startsWith("daisei_")) continue;
 
       if (
         mime === MimeType.GOOGLE_DOCS ||
@@ -31,7 +33,8 @@ function getFolderFileList(folderId) {
         list.push({
           id: file.getId(),
           name: name,
-          mimeType: mime
+          mimeType: mime,
+          sizeMB: Math.round(sizeMB * 10) / 10
         });
       }
     }
@@ -41,11 +44,20 @@ function getFolderFileList(folderId) {
   }
 }
 
-// 2. Récupère le contenu d'un seul fichier à la fois
+// 2. Extrait un seul fichier en ignorant ceux qui dépassent 12 Mo
 function getSingleFilePayload(fileId) {
   try {
     const file = DriveApp.getFileById(fileId);
     const mime = file.getMimeType();
+    const sizeBytes = file.getSize();
+
+    // Sécurité anti "Out of Memory" sur Google Apps Script
+    if (mime === MimeType.PDF && sizeBytes > 12 * 1024 * 1024) {
+      return { 
+        skipped: true, 
+        reason: `Fichier trop volumineux (${Math.round(sizeBytes / 1048576)} Mo > 12 Mo max)` 
+      };
+    }
 
     if (mime === MimeType.GOOGLE_DOCS) {
       return { type: "text", content: DocumentApp.openById(fileId).getBody().getText() };
@@ -54,21 +66,19 @@ function getSingleFilePayload(fileId) {
     } else if (mime === MimeType.PDF) {
       return { type: "pdf", base64: Utilities.base64Encode(file.getBlob().getBytes()) };
     }
-    return { type: "skip" };
+    return { skipped: true, reason: "Format non supporté" };
   } catch (err) {
-    return { error: err.message };
+    return { skipped: true, reason: err.message };
   }
 }
 
-// 3. Sauvegarde l'index vectoriel sur Google Drive pour ne pas recalculer à chaque fois
+// 3. Sauvegarde l'index vectoriel sur Drive
 function saveVectorIndexToDrive(folderId, jsonString) {
   try {
     const folder = DriveApp.getFolderById(folderId);
     const existing = folder.getFilesByName(INDEX_FILE_NAME);
-    
     if (existing.hasNext()) {
-      const file = existing.next();
-      file.setContent(jsonString);
+      existing.next().setContent(jsonString);
     } else {
       folder.createFile(INDEX_FILE_NAME, jsonString, MimeType.PLAIN_TEXT);
     }
@@ -77,24 +87,6 @@ function saveVectorIndexToDrive(folderId, jsonString) {
     return { error: err.message };
   }
 }
-
-// 4. Charge l'index vectoriel existant depuis Google Drive
-function loadVectorIndexFromDrive(folderId) {
-  try {
-    const folder = DriveApp.getFolderById(folderId);
-    const existing = folder.getFilesByName(INDEX_FILE_NAME);
-    
-    if (existing.hasNext()) {
-      const file = existing.next();
-      return { exists: true, content: file.getBlob().getDataAsString() };
-    }
-    return { exists: false };
-  } catch (err) {
-    return { error: err.message };
-  }
-}
-
-
 
 
 <!DOCTYPE html>
@@ -114,7 +106,7 @@ function loadVectorIndexFromDrive(folderId) {
     .message { max-width: 75%; padding: 12px 16px; border-radius: 8px; font-size: 14px; line-height: 1.5; white-space: pre-wrap; }
     .user { align-self: flex-end; background-color: #0b57d0; color: white; }
     .assistant { align-self: flex-start; background-color: white; border: 1px solid #e0e0e0; color: #1f1f1f; }
-    .system-info { align-self: center; font-size: 12px; color: #555; background: #eef3fc; padding: 6px 12px; border-radius: 12px; }
+    .system-info { align-self: center; font-size: 12px; color: #555; background: #eef3fc; padding: 8px 14px; border-radius: 12px; max-width: 85%; white-space: pre-wrap; }
     #input-area { padding: 16px 24px; background: white; border-top: 1px solid #e0e0e0; display: flex; gap: 12px; }
     textarea { flex: 1; resize: none; height: 48px; padding: 10px; border-radius: 6px; border: 1px solid #ccc; font-family: inherit; font-size: 14px; }
     button { padding: 9px 14px; border: none; background: #0b57d0; color: white; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 13px; }
@@ -125,13 +117,13 @@ function loadVectorIndexFromDrive(folderId) {
     label { font-size: 12px; font-weight: bold; color: #333; display: block; }
     .badge { font-size: 12px; padding: 6px 8px; border-radius: 4px; background: #eee; color: #333; }
     .badge.ok { background: #d4edda; color: #155724; }
-    #modelListBox { font-size: 11px; max-height: 110px; overflow-y: auto; background: #f1f3f4; padding: 6px; border-radius: 4px; display: none; white-space: pre-wrap; }
+    #modelListBox { font-size: 11px; max-height: 130px; overflow-y: auto; background: #f1f3f4; padding: 8px; border-radius: 4px; display: none; white-space: pre-wrap; border: 1px solid #ccc; }
   </style>
 </head>
 <body>
 
   <div id="sidebar">
-    <h3 style="margin: 0 0 4px 0;">Configuration RAG Vectoriel</h3>
+    <h3 style="margin: 0 0 4px 0;">RAG Vectoriel (Embeddings)</h3>
     
     <div>
       <label>Clé API DAISEI :</label>
@@ -148,7 +140,7 @@ function loadVectorIndexFromDrive(folderId) {
 
     <div>
       <label>Modèle d'Embedding :</label>
-      <input type="text" id="embedModel" placeholder="ex: bge-m3 ou text-embedding...">
+      <input type="text" id="embedModel" placeholder="Copiez un modèle d'embedding de la liste">
     </div>
 
     <div>
@@ -159,16 +151,15 @@ function loadVectorIndexFromDrive(folderId) {
     <hr style="width:100%; border:0; border-top:1px solid #ddd;">
 
     <div id="indexStatus" class="badge">Index : Non chargé</div>
-    <button class="secondary" id="loadIndexBtn" onclick="loadExistingIndex()">📂 Charger l'index existant</button>
-    <button id="buildIndexBtn" onclick="buildVectorIndex()">⚙️ Vectoriser / Indexer le dossier</button>
+    <button class="secondary" onclick="loadExistingIndex()">📂 Charger l'index existant</button>
+    <button id="buildIndexBtn" onclick="buildVectorIndex()">⚙️ Vectoriser le dossier</button>
   </div>
 
   <div id="chat-container">
     <div id="messages">
-      <div class="message assistant">Bonjour ! 
-1. Renseignez votre clé API, vos modèles (Chat et Embedding) et l'ID du dossier Drive.
-2. Cliquez sur <b>Vectoriser / Indexer le dossier</b> (ou <b>Charger l'index existant</b> si déjà fait).
-3. Posez vos questions : seuls les extraits vectoriels les plus pertinents seront envoyés au modèle !</div>
+      <div class="message assistant">Bonjour !
+1. Entrez votre <b>Clé API</b> et cliquez sur <b>🔍 Lister les modèles DAISEI</b> pour repérer le nom exact de votre modèle d'embedding.
+2. Remplissez les champs et cliquez sur <b>⚙️ Vectoriser le dossier</b> (les fichiers > 12 Mo seront automatiquement ignorés pour éviter toute erreur mémoire).</div>
     </div>
     <div id="input-area">
       <textarea id="userInput" placeholder="Posez une question sur vos documents..."></textarea>
@@ -178,7 +169,7 @@ function loadVectorIndexFromDrive(folderId) {
 
   <script>
     const BASE_URL = "https://daisei-api.ad6d-daiseicloudlab.aws.cloud.airbus.corp/api/v1";
-    let vectorStore = []; // Contient [{ source, text, embedding: [...] }]
+    let vectorStore = [];
     let conversationHistory = [];
 
     function appendMessage(role, text) {
@@ -197,21 +188,22 @@ function loadVectorIndexFromDrive(folderId) {
       badge.className = isOk ? "badge ok" : "badge";
     }
 
-    // Interroge /v1/models pour aider à trouver le nom exact du modèle d'embedding et de chat
     async function listModels() {
       const apiKey = document.getElementById("apiKey").value.trim();
       const box = document.getElementById("modelListBox");
       if (!apiKey) { alert("Renseignez d'abord la clé API."); return; }
 
       box.style.display = "block";
-      box.innerText = "Chargement des modèles...";
+      box.innerText = "Interrogation de /v1/models...";
       try {
         const res = await fetch(`${BASE_URL}/models`, {
           headers: { "Authorization": "Bearer " + apiKey }
         });
         const data = await res.json();
         if (data.data && Array.isArray(data.data)) {
-          box.innerText = data.data.map(m => "• " + m.id).join("\n");
+          box.innerText = "Modèles disponibles :\n" + data.data.map(m => "• " + m.id).join("\n");
+        } else if (Array.isArray(data)) {
+          box.innerText = "Modèles disponibles :\n" + data.map(m => "• " + (m.id || m)).join("\n");
         } else {
           box.innerText = JSON.stringify(data, null, 2);
         }
@@ -220,7 +212,6 @@ function loadVectorIndexFromDrive(folderId) {
       }
     }
 
-    // Découpe un long texte en petits paragraphes (chunks) de ~800 caractères
     function splitTextIntoChunks(text, chunkSize = 800, overlap = 150) {
       const cleaned = text.replace(/\s+/g, " ").trim();
       if (!cleaned) return [];
@@ -233,7 +224,6 @@ function loadVectorIndexFromDrive(folderId) {
       return chunks;
     }
 
-    // Appelle l'endpoint /v1/embeddings de DAISEI
     async function getEmbeddings(inputTexts, apiKey, embedModel) {
       const response = await fetch(`${BASE_URL}/embeddings`, {
         method: "POST",
@@ -254,7 +244,6 @@ function loadVectorIndexFromDrive(folderId) {
       return json.data.map(item => item.embedding);
     }
 
-    // Calcule la similarité cosinus entre deux vecteurs
     function cosineSimilarity(vecA, vecB) {
       let dot = 0.0, normA = 0.0, normB = 0.0;
       for (let i = 0; i < vecA.length; i++) {
@@ -266,7 +255,6 @@ function loadVectorIndexFromDrive(folderId) {
       return dot / (Math.sqrt(normA) * Math.sqrt(normB));
     }
 
-    // Extraction PDF complète page par page
     async function extractTextFromPDFBase64(base64Data) {
       const binaryString = atob(base64Data);
       const bytes = new Uint8Array(binaryString.length);
@@ -291,7 +279,6 @@ function loadVectorIndexFromDrive(folderId) {
       });
     }
 
-    // Charge un index déjà calculé et sauvegardé sur le Drive
     async function loadExistingIndex() {
       const folderId = document.getElementById("folderId").value.trim();
       if (!folderId) { alert("Renseignez l'ID du dossier Drive."); return; }
@@ -301,19 +288,18 @@ function loadVectorIndexFromDrive(folderId) {
         const res = await runAppsScript("loadVectorIndexFromDrive", folderId);
         if (res.error) throw new Error(res.error);
         if (!res.exists) {
-          updateBadge("Aucun index trouvé sur Drive.", false);
-          alert("Aucun fichier d'index trouvé dans ce dossier. Cliquez sur 'Vectoriser / Indexer le dossier'.");
+          updateBadge("Aucun index trouvé.", false);
+          alert("Aucun fichier d'index trouvé. Cliquez sur 'Vectoriser le dossier'.");
           return;
         }
         vectorStore = JSON.parse(res.content);
-        updateBadge(`Index prêt (${vectorStore.length} chunks)`, true);
+        updateBadge(`Index prêt (${vectorStore.length} vecteurs)`, true);
       } catch (err) {
         updateBadge("Erreur chargement index", false);
         alert("Erreur : " + err.message);
       }
     }
 
-    // Lit tous les fichiers un par un, les découpe, calcule les embeddings et sauvegarde sur Drive
     async function buildVectorIndex() {
       const apiKey = document.getElementById("apiKey").value.trim();
       const embedModel = document.getElementById("embedModel").value.trim();
@@ -325,9 +311,12 @@ function loadVectorIndexFromDrive(folderId) {
       }
 
       document.getElementById("buildIndexBtn").disabled = true;
-      const infoMsg = appendMessage("system-info", "Démarrage de l'indexation vectorielle...");
+      const infoMsg = appendMessage("system-info", "Vérification du modèle d'embedding et lecture du dossier...");
 
       try {
+        // Test rapide du modèle d'embedding avant de lire tous les fichiers
+        await getEmbeddings(["test"], apiKey, embedModel);
+
         const listRes = await runAppsScript("getFolderFileList", folderId);
         if (listRes.error) throw new Error(listRes.error);
 
@@ -339,34 +328,49 @@ function loadVectorIndexFromDrive(folderId) {
         }
 
         let newStore = [];
+        let skippedFiles = [];
 
         for (let i = 0; i < files.length; i++) {
           const f = files[i];
-          infoMsg.innerText = `[${i + 1}/${files.length}] Extraction du texte : ${f.name}...`;
-          const payload = await runAppsScript("getSingleFilePayload", f.id);
-          if (payload.error) continue;
 
-          let rawText = "";
-          if (payload.type === "text") rawText = payload.content;
-          else if (payload.type === "pdf") rawText = await extractTextFromPDFBase64(payload.base64);
+          // Sécurité supplémentaire côté client si le fichier dépasse 12 Mo
+          if (f.mimeType === "application/pdf" && f.sizeMB > 12) {
+            skippedFiles.push(`${f.name} (${f.sizeMB} Mo - trop volumineux)`);
+            continue;
+          }
 
-          const chunks = splitTextIntoChunks(rawText, 800, 150);
-          if (chunks.length === 0) continue;
+          infoMsg.innerText = `[${i + 1}/${files.length}] Lecture : ${f.name} (${f.sizeMB} Mo)...`;
 
-          // Vectorisation par petits lots de 10 chunks pour ne jamais saturer l'API
-          const batchSize = 10;
-          for (let b = 0; b < chunks.length; b += batchSize) {
-            const batchChunks = chunks.slice(b, b + batchSize);
-            infoMsg.innerText = `[${i + 1}/${files.length}] Vectorisation ${f.name} (chunks ${b + 1}-${Math.min(b + batchSize, chunks.length)}/${chunks.length})...`;
-            
-            const embeddings = await getEmbeddings(batchChunks, apiKey, embedModel);
-            for (let k = 0; k < batchChunks.length; k++) {
-              newStore.push({
-                source: f.name,
-                text: batchChunks[k],
-                embedding: embeddings[k]
-              });
+          try {
+            const payload = await runAppsScript("getSingleFilePayload", f.id);
+            if (payload.skipped) {
+              skippedFiles.push(`${f.name} (${payload.reason})`);
+              continue;
             }
+
+            let rawText = "";
+            if (payload.type === "text") rawText = payload.content;
+            else if (payload.type === "pdf") rawText = await extractTextFromPDFBase64(payload.base64);
+
+            const chunks = splitTextIntoChunks(rawText, 800, 150);
+            if (chunks.length === 0) continue;
+
+            const batchSize = 10;
+            for (let b = 0; b < chunks.length; b += batchSize) {
+              const batchChunks = chunks.slice(b, b + batchSize);
+              infoMsg.innerText = `[${i + 1}/${files.length}] Vectorisation ${f.name} (${b + 1}-${Math.min(b + batchSize, chunks.length)}/${chunks.length})...`;
+              
+              const embeddings = await getEmbeddings(batchChunks, apiKey, embedModel);
+              for (let k = 0; k < batchChunks.length; k++) {
+                newStore.push({
+                  source: f.name,
+                  text: batchChunks[k],
+                  embedding: embeddings[k]
+                });
+              }
+            }
+          } catch (fileErr) {
+            skippedFiles.push(`${f.name} (Erreur: ${fileErr.message})`);
           }
         }
 
@@ -374,8 +378,12 @@ function loadVectorIndexFromDrive(folderId) {
         infoMsg.innerText = `Sauvegarde de l'index (${vectorStore.length} vecteurs) dans Google Drive...`;
         await runAppsScript("saveVectorIndexToDrive", folderId, JSON.stringify(vectorStore));
 
-        updateBadge(`Index prêt (${vectorStore.length} chunks)`, true);
-        infoMsg.innerText = `✅ Indexation terminée avec succès ! ${vectorStore.length} segments vectorisés et sauvegardés sur Drive.`;
+        updateBadge(`Index prêt (${vectorStore.length} vecteurs)`, true);
+        let msg = `✅ Indexation terminée ! ${vectorStore.length} segments vectorisés.`;
+        if (skippedFiles.length > 0) {
+          msg += `\n\n⚠️ Fichiers ignorés :\n• ` + skippedFiles.join("\n• ");
+        }
+        infoMsg.innerText = msg;
 
       } catch (err) {
         infoMsg.innerText = "❌ Erreur lors de l'indexation : " + err.message;
@@ -384,7 +392,6 @@ function loadVectorIndexFromDrive(folderId) {
       }
     }
 
-    // Recherche vectorielle + Appel au modèle de Chat
     async function handleSend() {
       const input = document.getElementById("userInput");
       const apiKey = document.getElementById("apiKey").value.trim();
@@ -406,20 +413,17 @@ function loadVectorIndexFromDrive(folderId) {
       input.value = "";
       document.getElementById("sendBtn").disabled = true;
 
-      const loader = appendMessage("system-info", "Vectorisation de la question et recherche sémantique...");
+      const loader = appendMessage("system-info", "Vectorisation de la question et calcul de similarité cosinus...");
 
       try {
-        // 1. Vectorise la question de l'utilisateur
         const [queryVector] = await getEmbeddings([query], apiKey, embedModel);
 
-        // 2. Calcule la similarité avec tous les segments de documents
         const scoredChunks = vectorStore.map(item => ({
           source: item.source,
           text: item.text,
           score: cosineSimilarity(queryVector, item.embedding)
         }));
 
-        // 3. Trie et garde les 5 meilleurs extraits (Top-K = 5)
         scoredChunks.sort((a, b) => b.score - a.score);
         const topK = scoredChunks.slice(0, 5);
 
@@ -427,13 +431,12 @@ function loadVectorIndexFromDrive(folderId) {
           `[Extrait ${idx + 1} | Source: ${c.source} | Pertinence: ${(c.score * 100).toFixed(1)}%]\n${c.text}`
         ).join("\n\n");
 
-        loader.innerText = "Interrogation du modèle DAISEI avec les 5 meilleurs extraits...";
+        loader.innerText = "Génération de la réponse via DAISEI...";
 
         const ragPrompt = `Tu es un assistant expert. Réponds à la question de l'utilisateur en t'appuyant sur les extraits de documents fournis ci-dessous. Cite toujours le nom du fichier source utilisé.\n\n=== EXTRAITS PERTINENTS ===\n${contextBlock}\n\n=== QUESTION ===\n${query}`;
 
         conversationHistory.push({ role: "user", content: ragPrompt });
 
-        // 4. Envoie au modèle de Chat (uniquement les 5 extraits pertinents !)
         const response = await fetch(`${BASE_URL}/chat/completions`, {
           method: "POST",
           headers: {
@@ -442,7 +445,7 @@ function loadVectorIndexFromDrive(folderId) {
           },
           body: JSON.stringify({
             model: chatModel,
-            messages: conversationHistory.slice(-6) // Garde les derniers échanges pour rester léger
+            messages: conversationHistory.slice(-4)
           })
         });
 
@@ -466,3 +469,19 @@ function loadVectorIndexFromDrive(folderId) {
   </script>
 </body>
 </html>
+
+// 4. Charge l'index vectoriel depuis Drive
+function loadVectorIndexFromDrive(folderId) {
+  try {
+    const folder = DriveApp.getFolderById(folderId);
+    const existing = folder.getFilesByName(INDEX_FILE_NAME);
+    if (existing.hasNext()) {
+      return { exists: true, content: existing.next().getBlob().getDataAsString() };
+    }
+    return { exists: false };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+
