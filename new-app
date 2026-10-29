@@ -1,0 +1,239 @@
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('Index')
+    .setTitle('DAISEI RAG Chat')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function getDriveFolderFiles(folderId) {
+  if (!folderId) return { error: "ID de dossier Drive manquant." };
+
+  try {
+    const folder = DriveApp.getFolderById(folderId);
+    const files = folder.getFiles();
+    let fileList = [];
+
+    while (files.hasNext()) {
+      const file = files.next();
+      const mime = file.getMimeType();
+
+      if (mime === MimeType.GOOGLE_DOCS) {
+        fileList.push({
+          type: "text",
+          name: file.getName(),
+          content: DocumentApp.openById(file.getId()).getBody().getText()
+        });
+      } else if (mime === MimeType.PLAIN_TEXT || mime === "text/csv") {
+        fileList.push({
+          type: "text",
+          name: file.getName(),
+          content: file.getBlob().getDataAsString()
+        });
+      } else if (mime === MimeType.PDF) {
+        fileList.push({
+          type: "pdf",
+          name: file.getName(),
+          base64: Utilities.base64Encode(file.getBlob().getBytes())
+        });
+      }
+    }
+
+    return { files: fileList };
+  } catch (err) {
+    return { error: "Erreur lecture Drive : " + err.message };
+  }
+}
+
+
+
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <title>DAISEI Workspace Chat</title>
+  <!-- Chargement de PDF.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+  <script>
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+  </script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; display: flex; height: 100vh; background-color: #f8f9fa; }
+    #sidebar { width: 320px; background: #fff; border-right: 1px solid #e0e0e0; padding: 20px; box-sizing: border-box; display: flex; flex-direction: column; gap: 12px; }
+    #chat-container { flex: 1; display: flex; flex-direction: column; height: 100vh; }
+    #messages { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
+    .message { max-width: 75%; padding: 12px 16px; border-radius: 8px; font-size: 14px; line-height: 1.5; white-space: pre-wrap; }
+    .user { align-self: flex-end; background-color: #0b57d0; color: white; }
+    .assistant { align-self: flex-start; background-color: white; border: 1px solid #e0e0e0; color: #1f1f1f; }
+    .system-info { align-self: center; font-size: 12px; color: #70757a; font-style: italic; }
+    #input-area { padding: 16px 24px; background: white; border-top: 1px solid #e0e0e0; display: flex; gap: 12px; }
+    textarea { flex: 1; resize: none; height: 48px; padding: 10px; border-radius: 6px; border: 1px solid #ccc; font-family: inherit; font-size: 14px; }
+    button { padding: 0 20px; border: none; background: #0b57d0; color: white; border-radius: 6px; font-weight: bold; cursor: pointer; }
+    button:disabled { background: #ccc; }
+    input { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+    label { font-size: 12px; font-weight: bold; color: #444; }
+  </style>
+</head>
+<body>
+
+  <div id="sidebar">
+    <h3>Configuration RAG</h3>
+    <div>
+      <label>Clé API DAISEI :</label>
+      <input type="password" id="apiKey" placeholder="sk-...">
+    </div>
+    <div>
+      <label>Nom du Modèle :</label>
+      <input type="text" id="modelName" placeholder="ex: gpt-4o ou mistral">
+    </div>
+    <div>
+      <label>ID Dossier Google Drive :</label>
+      <input type="text" id="folderId" placeholder="Coller l'ID du dossier">
+    </div>
+  </div>
+
+  <div id="chat-container">
+    <div id="messages">
+      <div class="message assistant">Bonjour ! Vos documents PDF et Docs seront lus directement par le navigateur. Posez une question sur leur contenu.</div>
+    </div>
+    <div id="input-area">
+      <textarea id="userInput" placeholder="Posez une question sur vos documents..."></textarea>
+      <button id="sendBtn" onclick="handleSend()">Envoyer</button>
+    </div>
+  </div>
+
+  <script>
+    const API_URL = "https://daisei-api.ad6d-daiseicloudlab.aws.cloud.airbus.corp/api/v1/chat/completions";
+    let conversationHistory = [];
+
+    function appendMessage(role, text) {
+      const container = document.getElementById("messages");
+      const msg = document.createElement("div");
+      msg.className = `message ${role}`;
+      msg.innerText = text;
+      container.appendChild(msg);
+      container.scrollTop = container.scrollHeight;
+      return msg;
+    }
+
+    // Extraction du texte d'un PDF à partir de données Base64
+    async function extractTextFromPDFBase64(base64Data) {
+      const binaryString = atob(base64Data);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      const pdf = await pdfjsLib.getDocument({ data: bytes.buffer }).promise;
+      let fullText = "";
+
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const textContent = await page.getTextContent();
+        const pageStr = textContent.items.map(item => item.str).join(" ");
+        fullText += pageStr + "\n";
+      }
+      return fullText;
+    }
+
+    async function handleSend() {
+      const input = document.getElementById("userInput");
+      const apiKey = document.getElementById("apiKey").value.trim();
+      const model = document.getElementById("modelName").value.trim();
+      const folderId = document.getElementById("folderId").value.trim();
+      const query = input.value.trim();
+
+      if (!query) return;
+      if (!apiKey || !model || !folderId) {
+        alert("Veuillez renseigner la clé API, le modèle et l'ID du dossier Drive.");
+        return;
+      }
+
+      appendMessage("user", query);
+      input.value = "";
+      document.getElementById("sendBtn").disabled = true;
+
+      const loader = appendMessage("system-info", "Récupération des fichiers du dossier Drive...");
+
+      google.script.run
+        .withSuccessHandler(async function(res) {
+          if (res.error) {
+            loader.innerText = "Erreur: " + res.error;
+            document.getElementById("sendBtn").disabled = false;
+            return;
+          }
+
+          loader.innerText = "Lecture et extraction du texte des fichiers...";
+          let combinedContext = [];
+
+          for (const file of res.files) {
+            let extracted = "";
+            if (file.type === "text") {
+              extracted = file.content;
+            } else if (file.type === "pdf") {
+              try {
+                extracted = await extractTextFromPDFBase64(file.base64);
+              } catch (e) {
+                console.error("Erreur PDF " + file.name, e);
+              }
+            }
+
+            if (extracted && extracted.trim().length > 0) {
+              combinedContext.push(`--- Fichier : ${file.name} ---\n` + extracted.trim().substring(0, 5000));
+            }
+          }
+
+          if (combinedContext.length === 0) {
+            loader.innerText = "Aucun texte exploitable trouvé dans ces fichiers.";
+            document.getElementById("sendBtn").disabled = false;
+            return;
+          }
+
+          loader.innerText = "Génération de la réponse via DAISEI...";
+
+          const ragPrompt = `Tu es un assistant documentaire. Réponds à la question en utilisant les extraits suivants :\n\n${combinedContext.join("\n\n")}\n\nQuestion : ${query}`;
+          conversationHistory.push({ role: "user", content: ragPrompt });
+
+          try {
+            const response = await fetch(API_URL, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + apiKey
+              },
+              body: JSON.stringify({
+                model: model,
+                messages: conversationHistory
+              })
+            });
+
+            if (!response.ok) {
+              throw new Error("HTTP " + response.status + ": " + (await response.text()));
+            }
+
+            const data = await response.json();
+            const reply = data.choices[0].message.content.trim();
+
+            loader.remove();
+            appendMessage("assistant", reply);
+            conversationHistory.push({ role: "assistant", content: reply });
+
+          } catch (err) {
+            loader.innerText = "Erreur appel modèle: " + err.message;
+          } finally {
+            document.getElementById("sendBtn").disabled = false;
+          }
+        })
+        .withFailureHandler(function(err) {
+          loader.innerText = "Erreur Apps Script: " + err.message;
+          document.getElementById("sendBtn").disabled = false;
+        })
+        .getDriveFolderFiles(folderId);
+    }
+  </script>
+</body>
+</html>
+
+
+
+
