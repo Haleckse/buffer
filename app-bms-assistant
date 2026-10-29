@@ -218,3 +218,63 @@ function getDriveFolderContext(folderId, userQuery) {
   </script>
 </body>
 </html>
+
+
+function getDriveFolderContext(folderId, userQuery) {
+  if (!folderId) {
+    return { error: "ID de dossier Drive manquant." };
+  }
+
+  try {
+    const folder = DriveApp.getFolderById(folderId);
+    const files = folder.getFiles();
+    let documentsContent = [];
+
+    while (files.hasNext()) {
+      const file = files.next();
+      const mime = file.getMimeType();
+      let text = "";
+
+      // 1. Google Docs
+      if (mime === MimeType.GOOGLE_DOCS) {
+        text = DocumentApp.openById(file.getId()).getBody().getText();
+      } 
+      // 2. Fichiers texte brut / markdown / csv
+      else if (mime === MimeType.PLAIN_TEXT || mime === "text/csv") {
+        text = file.getBlob().getDataAsString();
+      } 
+      // 3. Fichiers PDF (extraction par conversion temporaire)
+      else if (mime === MimeType.PDF) {
+        try {
+          const blob = file.getBlob();
+          // Crée un Google Doc temporaire avec OCR pour extraire le texte
+          const tempDoc = Drive.Files.insert(
+            { title: "temp_ocr_" + file.getName(), mimeType: MimeType.GOOGLE_DOCS },
+            blob,
+            { ocr: true }
+          );
+          text = DocumentApp.openById(tempDoc.id).getBody().getText();
+          DriveApp.getFileById(tempDoc.id).setTrashed(true); // Supprime le fichier temporaire
+        } catch (pdfErr) {
+          // Si l'API Drive avancée n'est pas activée, fallback texte brut du blob
+          text = file.getBlob().getDataAsString();
+        }
+      }
+
+      // Nettoie et tronque le texte pour éviter d'exploser le contexte
+      if (text && text.trim().length > 0) {
+        documentsContent.push(`--- Document : ${file.getName()} ---\n` + text.trim().substring(0, 4000));
+      }
+    }
+
+    if (documentsContent.length === 0) {
+      return { context: "Le dossier ne contient aucun document lisible (Docs, PDF ou Texte)." };
+    }
+
+    // Fournit le contenu combiné des documents au modèle
+    return { context: documentsContent.join("\n\n") };
+
+  } catch (err) {
+    return { error: "Erreur lors de la lecture du dossier Drive : " + err.message };
+  }
+}
