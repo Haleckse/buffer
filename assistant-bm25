@@ -1,0 +1,429 @@
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('Index')
+    .setTitle('DAISEI RAG Chat')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+const INDEX_FILE_NAME = "daisei_bm25_index.json";
+
+function getFolderFileList(folderId) {
+  if (!folderId) return { error: "ID de dossier manquant." };
+
+  try {
+    const folder = DriveApp.getFolderById(folderId);
+    const files = folder.getFiles();
+    let list = [];
+
+    while (files.hasNext()) {
+      const file = files.next();
+      const name = file.getName();
+      const mime = file.getMimeType();
+      const sizeMB = file.getSize() / (1024 * 1024);
+
+      if (name === INDEX_FILE_NAME || name.startsWith("daisei_")) continue;
+
+      if (
+        mime === MimeType.GOOGLE_DOCS ||
+        mime === MimeType.PLAIN_TEXT ||
+        mime === "text/csv" ||
+        mime === MimeType.PDF
+      ) {
+        list.push({
+          id: file.getId(),
+          name: name,
+          mimeType: mime,
+          sizeMB: Math.round(sizeMB * 10) / 10
+        });
+      }
+    }
+    return { files: list };
+  } catch (err) {
+    return { error: "Erreur d'accès au dossier : " + err.message };
+  }
+}
+
+function getSingleFilePayload(fileId) {
+  try {
+    const file = DriveApp.getFileById(fileId);
+    const mime = file.getMimeType();
+    const sizeBytes = file.getSize();
+
+    // Protection contre "Out of memory" sur Apps Script (limite à ~12 Mo par PDF)
+    if (mime === MimeType.PDF && sizeBytes > 12 * 1024 * 1024) {
+      return { 
+        error: `Fichier trop lourd (${Math.round(sizeBytes / 1048576)} Mo). Convertissez-le en Google Docs dans Drive pour qu'il soit lu sans limite.` 
+      };
+    }
+
+    if (mime === MimeType.GOOGLE_DOCS) {
+      return { type: "text", content: DocumentApp.openById(fileId).getBody().getText() };
+    } else if (mime === MimeType.PLAIN_TEXT || mime === "text/csv") {
+      return { type: "text", content: file.getBlob().getDataAsString() };
+    } else if (mime === MimeType.PDF) {
+      return { type: "pdf", base64: Utilities.base64Encode(file.getBlob().getBytes()) };
+    }
+    return { type: "skip" };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+function saveIndexToDrive(folderId, jsonString) {
+  try {
+    const folder = DriveApp.getFolderById(folderId);
+    const existing = folder.getFilesByName(INDEX_FILE_NAME);
+    if (existing.hasNext()) {
+      existing.next().setContent(jsonString);
+    } else {
+      folder.createFile(INDEX_FILE_NAME, jsonString, MimeType.PLAIN_TEXT);
+    }
+    return { success: true };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+function loadIndexFromDrive(folderId) {
+  try {
+    const folder = DriveApp.getFolderById(folderId);
+    const existing = folder.getFilesByName(INDEX_FILE_NAME);
+    if (existing.hasNext()) {
+      return { exists: true, content: existing.next().getBlob().getDataAsString() };
+    }
+    return { exists: false };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <title>DAISEI RAG Chat</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+  <script>
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+  </script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; display: flex; height: 100vh; background-color: #f8f9fa; }
+    #sidebar { width: 330px; background: #fff; border-right: 1px solid #e0e0e0; padding: 18px; box-sizing: border-box; display: flex; flex-direction: column; gap: 10px; overflow-y: auto; }
+    #chat-container { flex: 1; display: flex; flex-direction: column; height: 100vh; }
+    #messages { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
+    .message { max-width: 75%; padding: 12px 16px; border-radius: 8px; font-size: 14px; line-height: 1.5; white-space: pre-wrap; }
+    .user { align-self: flex-end; background-color: #0b57d0; color: white; }
+    .assistant { align-self: flex-start; background-color: white; border: 1px solid #e0e0e0; color: #1f1f1f; }
+    .system-info { align-self: center; font-size: 12px; color: #555; background: #eef3fc; padding: 6px 12px; border-radius: 12px; }
+    #input-area { padding: 16px 24px; background: white; border-top: 1px solid #e0e0e0; display: flex; gap: 12px; }
+    textarea { flex: 1; resize: none; height: 48px; padding: 10px; border-radius: 6px; border: 1px solid #ccc; font-family: inherit; font-size: 14px; }
+    button { padding: 9px 14px; border: none; background: #0b57d0; color: white; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 13px; }
+    button.secondary { background: #4a5568; }
+    button:disabled { background: #ccc; cursor: not-allowed; }
+    input { width: 100%; box-sizing: border-box; padding: 7px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; margin-top: 3px; }
+    label { font-size: 12px; font-weight: bold; color: #333; display: block; }
+    .badge { font-size: 12px; padding: 6px 8px; border-radius: 4px; background: #eee; color: #333; }
+    .badge.ok { background: #d4edda; color: #155724; }
+  </style>
+</head>
+<body>
+
+  <div id="sidebar">
+    <h3 style="margin: 0 0 4px 0;">Configuration RAG</h3>
+    
+    <div>
+      <label>Clé API DAISEI :</label>
+      <input type="password" id="apiKey" placeholder="sk-...">
+    </div>
+
+    <div>
+      <label>Modèle de Chat :</label>
+      <input type="text" id="chatModel" placeholder="ex: mistral-small-24b-instruct-2501">
+    </div>
+
+    <div>
+      <label>ID Dossier Google Drive :</label>
+      <input type="text" id="folderId" placeholder="ID du dossier">
+    </div>
+
+    <hr style="width:100%; border:0; border-top:1px solid #ddd;">
+
+    <div id="indexStatus" class="badge">Index : Non chargé</div>
+    <button class="secondary" onclick="loadExistingIndex()">📂 Charger l'index existant</button>
+    <button id="buildIndexBtn" onclick="buildIndex()">⚙️ Indexer les documents</button>
+  </div>
+
+  <div id="chat-container">
+    <div id="messages">
+      <div class="message assistant">Bonjour !
+1. Renseignez votre clé API, votre modèle de Chat et l'ID du dossier Drive.
+2. Cliquez sur <b>Indexer les documents</b> (rapide et sans modèle d'embedding requis).
+3. Posez vos questions : le moteur extrait les 6 passages les plus pertinents et les envoie à DAISEI.</div>
+    </div>
+    <div id="input-area">
+      <textarea id="userInput" placeholder="Posez une question sur vos documents..."></textarea>
+      <button id="sendBtn" onclick="handleSend()">Envoyer</button>
+    </div>
+  </div>
+
+  <script>
+    const BASE_URL = "https://daisei-api.ad6d-daiseicloudlab.aws.cloud.airbus.corp/api/v1";
+    let chunkStore = []; // Contient [{ source, text }]
+    let conversationHistory = [];
+
+    function appendMessage(role, text) {
+      const container = document.getElementById("messages");
+      const msg = document.createElement("div");
+      msg.className = `message ${role}`;
+      msg.innerText = text;
+      container.appendChild(msg);
+      container.scrollTop = container.scrollHeight;
+      return msg;
+    }
+
+    function updateBadge(text, isOk) {
+      const badge = document.getElementById("indexStatus");
+      badge.innerText = text;
+      badge.className = isOk ? "badge ok" : "badge";
+    }
+
+    function splitTextIntoChunks(text, chunkSize = 900, overlap = 150) {
+      const cleaned = text.replace(/\s+/g, " ").trim();
+      if (!cleaned) return [];
+      const chunks = [];
+      let start = 0;
+      while (start < cleaned.length) {
+        chunks.push(cleaned.slice(start, start + chunkSize));
+        start += chunkSize - overlap;
+      }
+      return chunks;
+    }
+
+    // Nettoyage et tokenisation pour recherche BM25 (français + anglais)
+    function tokenize(str) {
+      return str
+        .toLowerCase()
+        .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+        .replace(/[^a-z0-9\s]/g, " ")
+        .split(/\s+/)
+        .filter(w => w.length > 2);
+    }
+
+    // Algorithme de classement de pertinence BM25 sur tous les chunks
+    function retrieveTopChunksBM25(query, chunks, topK = 6) {
+      const queryTokens = tokenize(query);
+      if (queryTokens.length === 0) return chunks.slice(0, topK);
+
+      const N = chunks.length;
+      const tokenizedDocs = chunks.map(c => tokenize(c.text + " " + c.source));
+      const avgdl = tokenizedDocs.reduce((sum, d) => sum + d.length, 0) / (N || 1);
+
+      // Calcul IDF pour chaque terme de la question
+      const idf = {};
+      queryTokens.forEach(term => {
+        let df = 0;
+        tokenizedDocs.forEach(doc => { if (doc.includes(term)) df++; });
+        idf[term] = Math.log(1 + (N - df + 0.5) / (df + 0.5));
+      });
+
+      const k1 = 1.5, b = 0.75;
+      const scored = chunks.map((chunk, idx) => {
+        const docTokens = tokenizedDocs[idx];
+        const dl = docTokens.length;
+        let score = 0;
+
+        queryTokens.forEach(term => {
+          let tf = 0;
+          for (let i = 0; i < dl; i++) {
+            if (docTokens[i] === term) tf++;
+          }
+          if (tf > 0) {
+            score += idf[term] * ((tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (dl / avgdl))));
+          }
+        });
+
+        return { ...chunk, score };
+      });
+
+      scored.sort((a, b) => b.score - a.score);
+      return scored.slice(0, topK);
+    }
+
+    async function extractTextFromPDFBase64(base64Data) {
+      const binaryString = atob(base64Data);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      const pdf = await pdfjsLib.getDocument({ data: bytes.buffer }).promise;
+      let fullText = "";
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const content = await page.getTextContent();
+        fullText += content.items.map(item => item.str).join(" ") + "\n";
+      }
+      return fullText;
+    }
+
+    function runAppsScript(fnName, ...args) {
+      return new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)[fnName](...args);
+      });
+    }
+
+    async function loadExistingIndex() {
+      const folderId = document.getElementById("folderId").value.trim();
+      if (!folderId) { alert("Renseignez l'ID du dossier Drive."); return; }
+
+      updateBadge("Chargement depuis Drive...", false);
+      try {
+        const res = await runAppsScript("loadIndexFromDrive", folderId);
+        if (res.error) throw new Error(res.error);
+        if (!res.exists) {
+          updateBadge("Aucun index trouvé.", false);
+          alert("Aucun index trouvé dans ce dossier. Cliquez sur 'Indexer les documents'.");
+          return;
+        }
+        chunkStore = JSON.parse(res.content);
+        updateBadge(`Index prêt (${chunkStore.length} extraits)`, true);
+      } catch (err) {
+        updateBadge("Erreur chargement", false);
+        alert("Erreur : " + err.message);
+      }
+    }
+
+    async function buildIndex() {
+      const folderId = document.getElementById("folderId").value.trim();
+      if (!folderId) {
+        alert("Veuillez renseigner l'ID du dossier Drive.");
+        return;
+      }
+
+      document.getElementById("buildIndexBtn").disabled = true;
+      const infoMsg = appendMessage("system-info", "Inventaire des fichiers du dossier...");
+
+      try {
+        const listRes = await runAppsScript("getFolderFileList", folderId);
+        if (listRes.error) throw new Error(listRes.error);
+
+        const files = listRes.files;
+        if (!files || files.length === 0) {
+          infoMsg.innerText = "Aucun fichier trouvé dans ce dossier.";
+          document.getElementById("buildIndexBtn").disabled = false;
+          return;
+        }
+
+        let newStore = [];
+        let skippedFiles = [];
+
+        for (let i = 0; i < files.length; i++) {
+          const f = files[i];
+          infoMsg.innerText = `[${i + 1}/${files.length}] Lecture : ${f.name} (${f.sizeMB} Mo)...`;
+
+          try {
+            const payload = await runAppsScript("getSingleFilePayload", f.id);
+            if (payload.error) {
+              skippedFiles.push(`${f.name} (${payload.error})`);
+              continue;
+            }
+
+            let rawText = "";
+            if (payload.type === "text") rawText = payload.content;
+            else if (payload.type === "pdf") rawText = await extractTextFromPDFBase64(payload.base64);
+
+            const chunks = splitTextIntoChunks(rawText, 900, 150);
+            chunks.forEach(c => {
+              newStore.push({ source: f.name, text: c });
+            });
+          } catch (fileErr) {
+            skippedFiles.push(`${f.name} (${fileErr.message})`);
+          }
+        }
+
+        chunkStore = newStore;
+        infoMsg.innerText = `Sauvegarde de l'index (${chunkStore.length} extraits) sur Drive...`;
+        await runAppsScript("saveIndexToDrive", folderId, JSON.stringify(chunkStore));
+
+        updateBadge(`Index prêt (${chunkStore.length} extraits)`, true);
+        let summary = `✅ Indexation terminée ! ${chunkStore.length} segments extraits sur ${files.length - skippedFiles.length} fichiers.`;
+        if (skippedFiles.length > 0) {
+          summary += `\n⚠️ Fichiers ignorés : ${skippedFiles.join(", ")}`;
+        }
+        infoMsg.innerText = summary;
+
+      } catch (err) {
+        infoMsg.innerText = "❌ Erreur lors de l'indexation : " + err.message;
+      } finally {
+        document.getElementById("buildIndexBtn").disabled = false;
+      }
+    }
+
+    async function handleSend() {
+      const input = document.getElementById("userInput");
+      const apiKey = document.getElementById("apiKey").value.trim();
+      const chatModel = document.getElementById("chatModel").value.trim();
+      const query = input.value.trim();
+
+      if (!query) return;
+      if (!apiKey || !chatModel) {
+        alert("Veuillez renseigner la clé API et le modèle de Chat.");
+        return;
+      }
+      if (chunkStore.length === 0) {
+        alert("L'index est vide. Cliquez d'abord sur 'Indexer les documents' ou 'Charger l'index existant'.");
+        return;
+      }
+
+      appendMessage("user", query);
+      input.value = "";
+      document.getElementById("sendBtn").disabled = true;
+
+      const loader = appendMessage("system-info", "Recherche des extraits les plus pertinents (BM25)...");
+
+      try {
+        const topChunks = retrieveTopChunksBM25(query, chunkStore, 6);
+
+        const contextBlock = topChunks.map((c, idx) => 
+          `[Extrait ${idx + 1} | Fichier: ${c.source}]\n${c.text}`
+        ).join("\n\n");
+
+        loader.innerText = "Interrogation du modèle DAISEI...";
+
+        const ragPrompt = `Tu es un assistant documentaire expert. Réponds à la question en te basant sur les extraits suivants. Cite le nom du fichier source pour chaque information.\n\n=== EXTRAITS DE DOCUMENTS ===\n${contextBlock}\n\n=== QUESTION ===\n${query}`;
+
+        conversationHistory.push({ role: "user", content: ragPrompt });
+
+        const response = await fetch(`${BASE_URL}/chat/completions`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + apiKey
+          },
+          body: JSON.stringify({
+            model: chatModel,
+            messages: conversationHistory.slice(-4)
+          })
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+        }
+
+        const data = await response.json();
+        const reply = data.choices[0].message.content.trim();
+
+        loader.remove();
+        appendMessage("assistant", reply);
+        conversationHistory.push({ role: "assistant", content: reply });
+
+      } catch (err) {
+        loader.innerText = "❌ Erreur : " + err.message;
+      } finally {
+        document.getElementById("sendBtn").disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>
