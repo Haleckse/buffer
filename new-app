@@ -4,46 +4,55 @@ function doGet() {
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
 
-function getDriveFolderFiles(folderId) {
-  if (!folderId) return { error: "ID de dossier Drive manquant." };
+// 1. Liste uniquement les identifiants et noms des fichiers (très léger en mémoire)
+function getFolderFileList(folderId) {
+  if (!folderId) return { error: "ID de dossier manquant." };
 
   try {
     const folder = DriveApp.getFolderById(folderId);
     const files = folder.getFiles();
-    let fileList = [];
+    let list = [];
 
     while (files.hasNext()) {
       const file = files.next();
       const mime = file.getMimeType();
-
-      if (mime === MimeType.GOOGLE_DOCS) {
-        fileList.push({
-          type: "text",
+      
+      // Filtre les types de fichiers supportés
+      if (mime === MimeType.GOOGLE_DOCS || mime === MimeType.PLAIN_TEXT || mime === "text/csv" || mime === MimeType.PDF) {
+        list.push({
+          id: file.getId(),
           name: file.getName(),
-          content: DocumentApp.openById(file.getId()).getBody().getText()
-        });
-      } else if (mime === MimeType.PLAIN_TEXT || mime === "text/csv") {
-        fileList.push({
-          type: "text",
-          name: file.getName(),
-          content: file.getBlob().getDataAsString()
-        });
-      } else if (mime === MimeType.PDF) {
-        fileList.push({
-          type: "pdf",
-          name: file.getName(),
-          base64: Utilities.base64Encode(file.getBlob().getBytes())
+          mimeType: mime
         });
       }
     }
 
-    return { files: fileList };
+    return { files: list };
   } catch (err) {
-    return { error: "Erreur lecture Drive : " + err.message };
+    return { error: "Erreur d'accès au dossier : " + err.message };
   }
 }
 
+// 2. Récupère le contenu d'un SEUL fichier à la fois
+function getSingleFilePayload(fileId) {
+  try {
+    const file = DriveApp.getFileById(fileId);
+    const mime = file.getMimeType();
 
+    if (mime === MimeType.GOOGLE_DOCS) {
+      return { type: "text", content: DocumentApp.openById(fileId).getBody().getText() };
+    } else if (mime === MimeType.PLAIN_TEXT || mime === "text/csv") {
+      return { type: "text", content: file.getBlob().getDataAsString() };
+    } else if (mime === MimeType.PDF) {
+      // Encode uniquement ce PDF
+      return { type: "pdf", base64: Utilities.base64Encode(file.getBlob().getBytes()) };
+    }
+
+    return { type: "skip" };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
 
 
 <!DOCTYPE html>
@@ -51,7 +60,6 @@ function getDriveFolderFiles(folderId) {
 <head>
   <meta charset="UTF-8">
   <title>DAISEI Workspace Chat</title>
-  <!-- Chargement de PDF.js -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
   <script>
     pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
@@ -83,7 +91,7 @@ function getDriveFolderFiles(folderId) {
     </div>
     <div>
       <label>Nom du Modèle :</label>
-      <input type="text" id="modelName" placeholder="ex: gpt-4o ou mistral">
+      <input type="text" id="modelName" placeholder="ex: identifiant-modele">
     </div>
     <div>
       <label>ID Dossier Google Drive :</label>
@@ -93,7 +101,7 @@ function getDriveFolderFiles(folderId) {
 
   <div id="chat-container">
     <div id="messages">
-      <div class="message assistant">Bonjour ! Vos documents PDF et Docs seront lus directement par le navigateur. Posez une question sur leur contenu.</div>
+      <div class="message assistant">Bonjour ! Vos documents sont extraits un par un pour ménager la mémoire. Posez votre question.</div>
     </div>
     <div id="input-area">
       <textarea id="userInput" placeholder="Posez une question sur vos documents..."></textarea>
@@ -115,7 +123,6 @@ function getDriveFolderFiles(folderId) {
       return msg;
     }
 
-    // Extraction du texte d'un PDF à partir de données Base64
     async function extractTextFromPDFBase64(base64Data) {
       const binaryString = atob(base64Data);
       const len = binaryString.length;
@@ -127,13 +134,23 @@ function getDriveFolderFiles(folderId) {
       const pdf = await pdfjsLib.getDocument({ data: bytes.buffer }).promise;
       let fullText = "";
 
-      for (let i = 1; i <= pdf.numPages; i++) {
+      // Limite la lecture aux 10 premières pages par document pour éviter d'alourdir
+      const maxPages = Math.min(pdf.numPages, 10);
+      for (let i = 1; i <= maxPages; i++) {
         const page = await pdf.getPage(i);
         const textContent = await page.getTextContent();
-        const pageStr = textContent.items.map(item => item.str).join(" ");
-        fullText += pageStr + "\n";
+        fullText += textContent.items.map(item => item.str).join(" ") + "\n";
       }
       return fullText;
+    }
+
+    function fetchFileContent(fileId) {
+      return new Promise((resolve, reject) => {
+        google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(reject)
+          .getSingleFilePayload(fileId);
+      });
     }
 
     async function handleSend() {
@@ -145,7 +162,7 @@ function getDriveFolderFiles(folderId) {
 
       if (!query) return;
       if (!apiKey || !model || !folderId) {
-        alert("Veuillez renseigner la clé API, le modèle et l'ID du dossier Drive.");
+        alert("Veuillez renseigner la clé API, le modèle et l'identifiant du dossier.");
         return;
       }
 
@@ -153,7 +170,7 @@ function getDriveFolderFiles(folderId) {
       input.value = "";
       document.getElementById("sendBtn").disabled = true;
 
-      const loader = appendMessage("system-info", "Récupération des fichiers du dossier Drive...");
+      const loader = appendMessage("system-info", "Inventaire des fichiers du dossier...");
 
       google.script.run
         .withSuccessHandler(async function(res) {
@@ -163,28 +180,41 @@ function getDriveFolderFiles(folderId) {
             return;
           }
 
-          loader.innerText = "Lecture et extraction du texte des fichiers...";
+          const fileList = res.files;
+          if (!fileList || fileList.length === 0) {
+            loader.innerText = "Aucun document trouvé dans ce dossier.";
+            document.getElementById("sendBtn").disabled = false;
+            return;
+          }
+
           let combinedContext = [];
 
-          for (const file of res.files) {
-            let extracted = "";
-            if (file.type === "text") {
-              extracted = file.content;
-            } else if (file.type === "pdf") {
-              try {
-                extracted = await extractTextFromPDFBase64(file.base64);
-              } catch (e) {
-                console.error("Erreur PDF " + file.name, e);
-              }
-            }
+          // Traitement séquentiel un à un pour libérer la mémoire à chaque étape
+          for (let i = 0; i < fileList.length; i++) {
+            const file = fileList[i];
+            loader.innerText = `Lecture du document ${i + 1} / ${fileList.length} (${file.name})...`;
 
-            if (extracted && extracted.trim().length > 0) {
-              combinedContext.push(`--- Fichier : ${file.name} ---\n` + extracted.trim().substring(0, 5000));
+            try {
+              const fileData = await fetchFileContent(file.id);
+              let text = "";
+
+              if (fileData.type === "text") {
+                text = fileData.content;
+              } else if (fileData.type === "pdf") {
+                text = await extractTextFromPDFBase64(fileData.base64);
+              }
+
+              if (text && text.trim().length > 0) {
+                // Troncature à 2000 caractères par document pour ne pas surcharger le modèle
+                combinedContext.push(`--- Document : ${file.name} ---\n` + text.trim().substring(0, 2000));
+              }
+            } catch (err) {
+              console.error("Erreur sur le fichier " + file.name, err);
             }
           }
 
           if (combinedContext.length === 0) {
-            loader.innerText = "Aucun texte exploitable trouvé dans ces fichiers.";
+            loader.innerText = "Aucun texte exploitable n'a pu être extrait.";
             document.getElementById("sendBtn").disabled = false;
             return;
           }
@@ -228,12 +258,8 @@ function getDriveFolderFiles(folderId) {
           loader.innerText = "Erreur Apps Script: " + err.message;
           document.getElementById("sendBtn").disabled = false;
         })
-        .getDriveFolderFiles(folderId);
+        .getFolderFileList(folderId);
     }
   </script>
 </body>
 </html>
-
-
-
-
