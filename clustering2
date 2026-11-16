@@ -1,0 +1,203 @@
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('DAISEI')
+    .addItem('Ouvrir l\'assistant', 'showSidebar')
+    .addToUi();
+}
+
+function showSidebar() {
+  const html = HtmlService.createHtmlOutputFromFile('Sidebar')
+    .setTitle('Assistant DAISEI');
+  SpreadsheetApp.getUi().showSidebar(html);
+}
+
+// Mode A : Récupère uniquement les cellules sélectionnées à la souris
+function getSelectedTasks() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const rangeList = sheet.getActiveRangeList();
+  if (!rangeList) return [];
+
+  const tasks = [];
+  const seenRows = new Set();
+
+  rangeList.getRanges().forEach(range => {
+    const startRow = range.getRow();
+    const numRows = range.getNumRows();
+    const values = range.getValues();
+
+    for (let i = 0; i < numRows; i++) {
+      const rowNum = startRow + i;
+      if (seenRows.has(rowNum)) continue;
+      seenRows.add(rowNum);
+
+      const prompt = values[i][0] != null ? String(values[i][0]).trim() : "";
+      if (prompt) {
+        tasks.push({ rowNumber: rowNum, prompt: prompt });
+      }
+    }
+  });
+
+  return tasks;
+}
+
+// Mode B : Récupère uniquement les lignes où la case à cocher est cochée (TRUE)
+function getCheckedTasks(srcColLetter, checkColLetter) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+
+  const srcCol = sheet.getRange(srcColLetter + "1").getColumn();
+  const checkCol = sheet.getRange(checkColLetter + "1").getColumn();
+
+  const srcValues = sheet.getRange(2, srcCol, lastRow - 1, 1).getValues();
+  const checkValues = sheet.getRange(2, checkCol, lastRow - 1, 1).getValues();
+
+  const tasks = [];
+  for (let i = 0; i < srcValues.length; i++) {
+    if (checkValues[i][0] === true) {
+      const prompt = srcValues[i][0] != null ? String(srcValues[i][0]).trim() : "";
+      if (prompt) {
+        tasks.push({ rowNumber: i + 2, prompt: prompt });
+      }
+    }
+  }
+  return tasks;
+}
+
+function writeResult(rowNumber, targetColLetter, text, checkColLetter) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  sheet.getRange(targetColLetter + rowNumber).setValue(text);
+  // Décoche automatiquement la case si une colonne de coche est utilisée
+  if (checkColLetter) {
+    const checkCell = sheet.getRange(checkColLetter + rowNumber);
+    if (checkCell.getValue() === true) checkCell.setValue(false);
+  }
+}
+
+
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <style>
+      body { font-family: sans-serif; padding: 12px; font-size: 13px; }
+      label { display: block; margin-top: 8px; font-weight: bold; }
+      input { width: 100%; box-sizing: border-box; padding: 6px; margin-top: 4px; }
+      .row { display: flex; gap: 8px; }
+      .row div { flex: 1; }
+      button { width: 100%; padding: 9px; margin-top: 10px; cursor: pointer; font-weight: bold; }
+      button.secondary { background: #f1f3f4; border: 1px solid #dadce0; color: #202124; }
+      #status { margin-top: 12px; white-space: pre-wrap; font-size: 12px; color: #333; }
+      hr { border: 0; border-top: 1px solid #e0e0e0; margin: 14px 0; }
+    </style>
+  </head>
+  <body>
+    <h3>Assistant DAISEI</h3>
+    
+    <label>Clé API :</label>
+    <input type="password" id="apiKey" placeholder="sk-...">
+
+    <label>Nom du modèle :</label>
+    <input type="text" id="modelName" placeholder="ex: identifiant-modele">
+
+    <label>Colonne où écrire la réponse :</label>
+    <input type="text" id="targetCol" value="B" placeholder="ex: B">
+
+    <hr>
+
+    <button id="btnSel" onclick="run('selection')">1. Traiter les cellules sélectionnées</button>
+
+    <div class="row" style="margin-top: 8px;">
+      <div>
+        <label>Col. Prompt :</label>
+        <input type="text" id="srcCol" value="A">
+      </div>
+      <div>
+        <label>Col. Coche :</label>
+        <input type="text" id="checkCol" value="C">
+      </div>
+    </div>
+    <button id="btnCheck" class="secondary" onclick="run('checked')">2. Traiter les lignes cochées</button>
+
+    <div id="status">Sélectionne des cellules ou coche des cases, puis lance.</div>
+
+    <script>
+      const API_URL = "https://daisei-api.ad6d-daiseicloudlab.aws.cloud.airbus.corp/api/v1/chat/completions";
+
+      async function callDaisei(prompt, apiKey, model) {
+        const res = await fetch(API_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + apiKey
+          },
+          body: JSON.stringify({
+            model: model,
+            messages: [{ role: "user", content: prompt }]
+          })
+        });
+        if (!res.ok) throw new Error("HTTP " + res.status + ": " + (await res.text()));
+        const data = await res.json();
+        return data.choices[0].message.content.trim();
+      }
+
+      function setDisabled(state) {
+        document.getElementById('btnSel').disabled = state;
+        document.getElementById('btnCheck').disabled = state;
+      }
+
+      function run(mode) {
+        const apiKey = document.getElementById('apiKey').value.trim();
+        const model = document.getElementById('modelName').value.trim();
+        const targetCol = document.getElementById('targetCol').value.trim().toUpperCase();
+        const srcCol = document.getElementById('srcCol').value.trim().toUpperCase();
+        const checkCol = document.getElementById('checkCol').value.trim().toUpperCase();
+        const status = document.getElementById('status');
+
+        if (!apiKey || !model || !targetCol) {
+          status.innerText = "Renseigne la clé API, le modèle et la colonne cible.";
+          return;
+        }
+
+        setDisabled(true);
+        status.innerText = "Récupération des lignes...";
+
+        const runner = google.script.run
+          .withFailureHandler(err => {
+            status.innerText = "Erreur : " + err.message;
+            setDisabled(false);
+          })
+          .withSuccessHandler(async tasks => {
+            if (!tasks || tasks.length === 0) {
+              status.innerText = "Aucune cellule valide trouvée.";
+              setDisabled(false);
+              return;
+            }
+
+            for (let i = 0; i < tasks.length; i++) {
+              const t = tasks[i];
+              status.innerText = `Traitement ${i + 1}/${tasks.length} (ligne ${t.rowNumber})...`;
+              try {
+                const answer = await callDaisei(t.prompt, apiKey, model);
+                await new Promise(r => google.script.run
+                  .withSuccessHandler(r)
+                  .writeResult(t.rowNumber, targetCol, answer, mode === 'checked' ? checkCol : null)
+                );
+              } catch (e) {
+                google.script.run.writeResult(t.rowNumber, targetCol, "Erreur: " + e.message, null);
+              }
+            }
+
+            status.innerText = `Terminé (${tasks.length} ligne(s)).`;
+            setDisabled(false);
+          });
+
+        if (mode === 'selection') {
+          runner.getSelectedTasks();
+        } else {
+          runner.getCheckedTasks(srcCol, checkCol);
+        }
+      }
+    </script>
+  </body>
+</html>
