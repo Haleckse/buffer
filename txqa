@@ -1,0 +1,144 @@
+/* ===========================================================================
+   SECTION 06: EXTRACTING ROOT CAUSES AND STANDARDS (PPS)
+   Goal: We import the manual analysis file where auditors linked problems 
+   to specific quality standards (like EN9100) and root causes.
+   =========================================================================== */
+LIB CONNECT TO 'GDRIVE_BQA DATA MODEL';
+
+// ===========================================================================
+// --- 1. MAIN TABLE (BASE DATA) ---
+// We import the raw text and decide which ID to use to link the data.
+// ===========================================================================
+
+Temp_RetrievePPS_Base:
+LOAD 
+   // 🟢 ID Selection: We use the official system ID if available. 
+    // If it is missing, we use the manual ID created in Excel
+    
+    // If(Len(Trim([Finding id]))>0, 
+        // Trim([Finding id]), 
+        // Trim([Manual_Finding_Key])
+    // ) AS [%Key_Finding_Action], 
+    
+    //Trim([Manual_Finding_Key]) AS [%Key_Finding_Action], 
+    
+    Upper(PurgeChar(Trim(SubField([Ref Audit No & Finding Title], ' ', 1)), ' .#<>-')) AS [PPS_Manual_Key],
+    Trim(Mid([Ref Audit No & Finding Title], Index([Ref Audit No & Finding Title], ' ') + 1)) AS [Manual_Finding_Title],
+    
+    Trim([Causes Codes (the most relevant ones)]) AS [Raw_Causes],
+    Trim([NC Classification iaw with EN9100 (use the most topic specific one possible)]) AS [Raw_EN9100],
+    Trim([AQAP PECAL cluster]) AS [Raw_AQAP],
+    Trim([EMAR PERAM cluster]) AS [Raw_EMAR],
+    Trim([PPS (link if any)]) AS [Raw_PPS_Link],
+    
+    Trim([Text from EN9100 clarifying non compliance and comments]) AS [EN9100_Clarification_cor], 
+    Trim([Root Cause Description]) AS [Root_Cause_Desc_cor],
+    Trim([PPS/Comment column]) AS [PPS_Comment_cor],
+    If(Lower(Trim([PPS done in NCCAPA]))='x', 1, 0) AS [Flag_PPS_NCCAPA_Done]
+
+// We exclude lines marked as duplicates in the Excel file
+WHERE Lower(Trim([Duplicates])) <> 'x';
+
+SELECT * FROM GetSheetValues
+WITH PROPERTIES (
+    spreadsheetKey='1gWaMNGERnh_9Upb22uesre405aC6nxGFtS_2JJoElRw',
+    range='RetrievePPS_Qlik',
+    valueRenderOption='FORMATTED_VALUE',
+    dateTimeRenderOption='FORMATTED_STRING',
+    generatedNumberedColumns='false',
+    skipRows=''
+);
+
+// ===========================================================================
+// --- 2. SEPARATING EN9100 STANDARDS ---
+// We split the standard codes into chapters and use our dictionary to translate them.
+// ===========================================================================
+
+Bridge_PPS_EN9100:
+LOAD DISTINCT
+    [%Key_Finding_Action],
+    
+    // Extracting the pure chapter numbers (Level 0 and Level 1)
+    SubField([EN9100_Chapter_Code], '.', 1) AS [EN9100_L0],
+    If(SubStringCount([EN9100_Chapter_Code], '.') >= 1, 
+        SubField([EN9100_Chapter_Code], '.', 1) & '.' & SubField([EN9100_Chapter_Code], '.', 2), 
+        [EN9100_Chapter_Code]
+    ) AS [EN9100_L1],
+    
+    // 🟢 Translating the numbers into readable chapter names using the dictionary
+    ApplyMap('Map_Chapter_L0', Trim(SubField([EN9100_Chapter_Code], '.', 1)), 'Other') AS [Chapter_L0_Name],
+    ApplyMap('Map_Chapter_L1', Trim(If(SubStringCount([EN9100_Chapter_Code], '.') >= 1, SubField([EN9100_Chapter_Code], '.', 1) & '.' & SubField([EN9100_Chapter_Code], '.', 2), [EN9100_Chapter_Code])), 'Other') AS [Chapter_L1_Name],
+
+    // Keeping the original unedited text
+    [EN9100_Chapter_Code],
+    [EN9100_Full_Label];
+LOAD DISTINCT
+    [%Key_Finding_Action],
+    Trim(SubField(Trim(SubField(Replace(Replace([Raw_EN9100], '&', ';'), ',', ';'), ';')), ' ', 1)) AS [EN9100_Chapter_Code],
+    SubField(Replace(Replace([Raw_EN9100], '&', ';'), ',', ';'), ';') AS [EN9100_Full_Label]
+RESIDENT Temp_RetrievePPS_Base
+WHERE Len(Trim([Raw_EN9100])) > 0;
+
+// ===========================================================================
+// --- 3. SEPARATING CAUSE CODES ---
+// If an issue has multiple causes, we separate them so the user can filter them individually.
+// ===========================================================================
+
+Bridge_PPS_Causes:
+LOAD DISTINCT
+    [%Key_Finding_Action],
+    SubField(Replace(Trim([Raw_Causes]), ';', ','), ',') AS [Causes_Codes_Atomic]
+RESIDENT Temp_RetrievePPS_Base
+WHERE Len(Trim([Raw_Causes])) > 0;
+
+// ===========================================================================
+// --- 4. SEPARATING AQAP CODES ---
+// ===========================================================================
+
+Bridge_PPS_AQAP:
+LOAD DISTINCT
+    [%Key_Finding_Action],
+SubField(Replace(Replace(Replace(Replace(Trim([Raw_AQAP]), Chr(10), ','), Chr(13), ','), '&', ','), ';', ','), ',') AS [AQAP_Atomic]
+RESIDENT Temp_RetrievePPS_Base
+WHERE Len(Trim([Raw_AQAP])) > 0;
+
+// ===========================================================================
+// --- 5. SEPARATING EMAR CODES ---
+// ===========================================================================
+
+Bridge_PPS_EMAR:
+LOAD DISTINCT
+    [%Key_Finding_Action],
+SubField(Replace(Replace(Replace(Replace(Trim([Raw_EMAR]), Chr(10), ','), Chr(13), ','), '&', ','), ';', ','), ',') AS [EMAR_Atomic]
+RESIDENT Temp_RetrievePPS_Base
+WHERE Len(Trim([Raw_EMAR])) > 0;
+
+// ===========================================================================
+// --- 6. SEPARATING WEB LINKS ---
+// ===========================================================================
+
+Bridge_PPS_Links:
+LOAD DISTINCT
+    [%Key_Finding_Action],
+    SubField(Trim([Raw_PPS_Link]), Chr(10)) AS [PPS_Link_Atomic]
+RESIDENT Temp_RetrievePPS_Base
+WHERE Len(Trim([Raw_PPS_Link])) > 0;
+
+
+// ===========================================================================
+// --- 7. SAVING AND MEMORY CLEANUP ---
+// We save these separated lists into files and delete the temporary data to save memory.
+// ============================================================================
+
+TRACE [Doc 6 RetrievePPS] QVDs Exported;
+
+STORE Temp_RetrievePPS_Base INTO [lib://AttachedFiles/RetrievePPS.qvd] (qvd);
+STORE Bridge_PPS_EN9100 INTO [lib://AttachedFiles/Bridge_PPS_EN9100.qvd] (qvd);
+STORE Bridge_PPS_Causes INTO [lib://AttachedFiles/Bridge_PPS_Causes.qvd] (qvd);
+STORE Bridge_PPS_AQAP INTO [lib://AttachedFiles/Bridge_PPS_AQAP.qvd] (qvd);
+STORE Bridge_PPS_EMAR INTO [lib://AttachedFiles/Bridge_PPS_EMAR.qvd] (qvd);
+STORE Bridge_PPS_Links INTO [lib://AttachedFiles/Bridge_PPS_Links.qvd] (qvd);
+
+DROP Table Temp_RetrievePPS_Base, Bridge_PPS_EN9100, Bridge_PPS_Causes, Bridge_PPS_AQAP, Bridge_PPS_EMAR, Bridge_PPS_Links;
+
+
