@@ -12,15 +12,8 @@ LIB CONNECT TO 'GDRIVE_BQA DATA MODEL';
 
 Temp_RetrievePPS_Base:
 LOAD 
-   // 🟢 ID Selection: We use the official system ID if available. 
-    // If it is missing, we use the manual ID created in Excel
-    
-    // If(Len(Trim([Finding id]))>0, 
-        // Trim([Finding id]), 
-        // Trim([Manual_Finding_Key])
-    // ) AS [%Key_Finding_Action], 
-    
-    //Trim([Manual_Finding_Key]) AS [%Key_Finding_Action], 
+    // 🟢 ID Selection: We use the official system ID
+    Trim([Finding id]) AS [%Key_Finding_Action], 
     
     Upper(PurgeChar(Trim(SubField([Ref Audit No & Finding Title], ' ', 1)), ' .#<>-')) AS [PPS_Manual_Key],
     Trim(Mid([Ref Audit No & Finding Title], Index([Ref Audit No & Finding Title], ' ') + 1)) AS [Manual_Finding_Title],
@@ -140,5 +133,3 @@ STORE Bridge_PPS_EMAR INTO [lib://AttachedFiles/Bridge_PPS_EMAR.qvd] (qvd);
 STORE Bridge_PPS_Links INTO [lib://AttachedFiles/Bridge_PPS_Links.qvd] (qvd);
 
 DROP Table Temp_RetrievePPS_Base, Bridge_PPS_EN9100, Bridge_PPS_Causes, Bridge_PPS_AQAP, Bridge_PPS_EMAR, Bridge_PPS_Links;
-
-
