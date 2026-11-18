@@ -5,7 +5,7 @@
  * 3. Sends automated email notifications on assignment or status change.
  * 
  * TRIGGERS TO SET in Apps Script Dashboard (Triggers -> Add Trigger):
- *  1. Function: handleSpreadsheetEdit  | Event: On edit
+ *  1. Function: handleSpreadsheetEdit  | Event: On edit (Installable Trigger)
  *  2. Function: handleFormSubmit       | Event: On form submit (if using Google Forms)
  */
 
@@ -36,7 +36,7 @@ function getOrGenerateTicketId(sheet, row, ticketIdCol) {
     const props = PropertiesService.getDocumentProperties();
     let lastNumber = Number(props.getProperty("LAST_TICKET_NUMBER"));
 
-    // If counter is not set yet, discover the highest existing ticket number in column K
+    // If counter is not set yet, discover the highest existing ticket number
     if (!lastNumber || isNaN(lastNumber)) {
       lastNumber = 0;
       const lastRow = sheet.getLastRow();
@@ -68,19 +68,22 @@ function getOrGenerateTicketId(sheet, row, ticketIdCol) {
   }
 }
 
+// ==========================================
+// 2. FORM SUBMIT HANDLER (Trigger: On form submit)
+// ==========================================
+
 /**
- * 2. FORM SUBMIT HANDLER (Trigger: On form submit)
- * Reads the submission from 'Form Responses', generates an ID, and appends to 'Database'.
+ * Reads submission from 'Form Responses', generates an ID, and appends to 'Tickets'.
  */
 function handleFormSubmit(e) {
   if (!e || !e.range) return;
   const sourceSheet = e.range.getSheet();
-  
+
   // Verify submission came from the Form Responses tab
   if (!sourceSheet.getName().toLowerCase().includes("form response")) return;
-  
+
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const dbSheet = ss.getSheetByName("Database");
+  const dbSheet = ss.getSheetByName("Tickets");
   if (!dbSheet) return;
 
   const formRow = e.range.getRow();
@@ -111,14 +114,14 @@ function handleFormSubmit(e) {
     if (h) dbColMap[String(h).trim().toLowerCase()] = idx + 1;
   });
 
-  // Next available row in Database
+  // Next available row in Tickets
   const nextDbRow = dbSheet.getLastRow() + 1;
   const ticketIdCol = dbColMap['ticket id'];
-  
+
   // 1. Generate atomic sequential Ticket ID
   const ticketId = getOrGenerateTicketId(dbSheet, nextDbRow, ticketIdCol);
 
-  // 2. Populate fields into Database
+  // 2. Populate fields into Tickets
   const setDbVal = (colKey, val) => {
     const col = dbColMap[colKey.toLowerCase()];
     if (col) dbSheet.getRange(nextDbRow, col).setValue(val);
@@ -144,17 +147,18 @@ function handleFormSubmit(e) {
 // ==========================================
 // 3. EDIT HANDLER (ON SPREADSHEET EDIT)
 // ==========================================
+
 function handleSpreadsheetEdit(e) {
   if (!e || !e.range) return;
-  
+
   const sheet = e.range.getSheet();
-  if (sheet.getName() !== "Database") return;
-  
+  if (sheet.getName() !== "Tickets") return;
+
   const row = e.range.getRow();
   const col = e.range.getColumn();
-  
+
   if (row <= 1) return; // Ignore header edits
-  
+
   // 1. Map columns dynamically from Row 1
   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
   const colMap = {};
@@ -163,25 +167,25 @@ function handleSpreadsheetEdit(e) {
       colMap[h.trim().toLowerCase()] = idx + 1;
     }
   });
-  
+
   const ticketIdCol = colMap['ticket id'];
   if (!ticketIdCol) return;
 
   // 2. Ensure Ticket ID exists and is permanent
   const ticketId = getOrGenerateTicketId(sheet, row, ticketIdCol);
 
-  // If user edited the Ticket ID column itself, ignore or prevent re-logging
+  // If user edited the Ticket ID column itself, ignore
   if (col === ticketIdCol) return;
 
   const editedHeaderName = headers[col - 1] ? String(headers[col - 1]).trim() : `Column ${col}`;
-  
+
   // 3. Fetch current row data
   const rowData = sheet.getRange(row, 1, 1, headers.length).getValues()[0];
   const getVal = (key) => {
     const c = colMap[key];
     return (c && rowData[c - 1] !== undefined && rowData[c - 1] !== null) ? String(rowData[c - 1]).trim() : '';
   };
-  
+
   const summary         = getVal('summary') || '(Untitled Request)';
   const requesterEmail  = getVal('email address');
   const siglum          = getVal('siglum');
@@ -190,26 +194,33 @@ function handleSpreadsheetEdit(e) {
   const urgentIndicator = getVal('urgency') || 'Default';
   const requestType     = getVal('request type') || '-';
   const status          = getVal('status') || 'To Do';
-  const assigneeName    = getVal('assignee name') || getVal('assigned agent');
-  const assigneeEmail   = getVal('assignee email');
-  
+
+  // Support both "assignee" and "assignee name"
+  const assigneeName    = getVal('assignee') || getVal('assignee name');
+
+  // Look up Assignee Email from Tickets sheet first; if not present, look up from "Team" sheet
+  let assigneeEmail     = getVal('assignee email');
+  if (!assigneeEmail && assigneeName) {
+    assigneeEmail = lookupAssigneeEmailFromTeam(sheet.getParent(), assigneeName);
+  }
+
   // Values before and after
   const oldValue = e.oldValue !== undefined ? String(e.oldValue) : '(Empty)';
   const newValue = e.value !== undefined ? String(e.value) : String(rowData[col - 1] || '');
-  
+
   if (oldValue === newValue) return;
-  
+
   // 4. Log change to the "Ticket History" tab
   logToTicketHistory(ticketId, editedHeaderName, oldValue, newValue);
-  
+
   // 5. Send email notifications if Status or Assignee was updated
   const STATUS_COL = colMap['status'];
-  const ASSIGNEE_COL = colMap['assignee name'] || colMap['assigned agent'];
+  const ASSIGNEE_COL = colMap['assignee'] || colMap['assignee name'];
   const ASSIGNEE_EMAIL_COL = colMap['assignee email'];
-  
+
   const isStatusChange = (col === STATUS_COL);
-  const isAssignment   = (col === ASSIGNEE_COL || col === ASSIGNEE_EMAIL_COL);
-  
+  const isAssignment   = (col === ASSIGNEE_COL || (ASSIGNEE_EMAIL_COL && col === ASSIGNEE_EMAIL_COL));
+
   if (isStatusChange || isAssignment) {
     sendNotificationEmail({
       ticketId,
@@ -229,27 +240,50 @@ function handleSpreadsheetEdit(e) {
   }
 }
 
+/**
+ * Looks up the agent's email address in the "Team" tab by matching Name or Assignee handle.
+ */
+function lookupAssigneeEmailFromTeam(spreadsheet, assigneeName) {
+  if (!assigneeName) return '';
+  const teamSheet = spreadsheet.getSheetByName("Team");
+  if (!teamSheet || teamSheet.getLastRow() <= 1) return '';
+
+  const teamData = teamSheet.getDataRange().getValues();
+  const teamHeaders = teamData[0].map(h => String(h).trim().toLowerCase());
+
+  const nameIdx = teamHeaders.findIndex(h => h === "assignee name" || h === "assignee");
+  const emailIdx = teamHeaders.findIndex(h => h === "assignee email" || h === "email");
+
+  if (nameIdx === -1 || emailIdx === -1) return '';
+
+  const target = assigneeName.trim().toLowerCase();
+  for (let i = 1; i < teamData.length; i++) {
+    const currentName = String(teamData[i][nameIdx] || '').trim().toLowerCase();
+    if (currentName === target) {
+      return String(teamData[i][emailIdx] || '').trim();
+    }
+  }
+  return '';
+}
+
 // ==========================================
 // 4. AUDIT TRAIL LOGGING
 // ==========================================
+
 function logToTicketHistory(ticketId, fieldModified, oldValue, newValue) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let historySheet = ss.getSheetByName("Ticket History");
-  
-  if (!historySheet) {
-    historySheet = ss.insertSheet("Ticket History");
-    historySheet.appendRow(["Timestamp", "Ticket ID", "Field Modified", "Old Value", "New Value", "Modified By"]);
-    historySheet.getRange("A1:F1").setFontWeight("bold").setBackground("#f1f5f9");
-    historySheet.setFrozenRows(1);
-  } else if (historySheet.getLastRow() === 0) {
+
+  if (!historySheet || historySheet.getLastRow() === 0) {
+    if (!historySheet) historySheet = ss.insertSheet("Ticket History");
     historySheet.appendRow(["Timestamp", "Ticket ID", "Field Modified", "Old Value", "New Value", "Modified By"]);
     historySheet.getRange("A1:F1").setFontWeight("bold").setBackground("#f1f5f9");
     historySheet.setFrozenRows(1);
   }
-  
+
   const user = Session.getActiveUser().getEmail() || "Portal User";
   const now = new Date();
-  
+
   historySheet.appendRow([
     now,
     ticketId,
@@ -263,8 +297,10 @@ function logToTicketHistory(ticketId, fieldModified, oldValue, newValue) {
 // ==========================================
 // 5. EMAIL NOTIFICATIONS
 // ==========================================
+
 function sendNotificationEmail(t) {
-  const isUrgent = t.urgentIndicator.toUpperCase().includes('URGENT') || t.criticality.toLowerCase() === 'high';
+  const isUrgent = (t.urgentIndicator || '').toUpperCase().includes('URGENT') || 
+                   (t.criticality || '').toLowerCase() === 'high';
 
   const detailsTable = `
     <table style="width: 100%; border-collapse: collapse; margin: 18px 0; font-size: 13px;">
@@ -291,7 +327,7 @@ function sendNotificationEmail(t) {
       <tr style="background-color: #f8fafc;">
         <td style="padding: 10px 12px; font-weight: 600; border-bottom: 1px solid #e2e8f0; color: #64748b;">Assigned Agent:</td>
         <td style="padding: 10px 12px; border-bottom: 1px solid #e2e8f0; color: #0f172a;">
-          ${t.assigneeName ? `${t.assigneeName} (${t.assigneeEmail || 'No email'})` : '<em>Currently Unassigned</em>'}
+          ${t.assigneeName ? `${t.assigneeName} (${t.assigneeEmail || 'No email registered'})` : '<em>Currently Unassigned</em>'}
         </td>
       </tr>
       <tr>
@@ -370,8 +406,11 @@ function sendNotificationEmail(t) {
 
     try {
       GmailApp.sendEmail(t.assigneeEmail, subject, t.summary, { htmlBody });
+      console.log(`Assignment notification email successfully sent to: ${t.assigneeEmail}`);
     } catch (err) {
       console.error('Failed to email assignee: ' + err.message);
     }
+  } else if (t.isAssignment && (!t.assigneeEmail || !t.assigneeEmail.includes('@'))) {
+    console.warn(`Assignee changed to "${t.assigneeName}", but no valid email address was found in the Team tab.`);
   }
 }
