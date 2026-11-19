@@ -1,0 +1,941 @@
+/**
+ * Unified BMS Support Handler
+ * 
+ * 1. Guarantees atomic, permanent Ticket ID generation (BMS-XXXXX).
+ * 2. Logs all ticket changes to the "Ticket History" tab.
+ * 3. Sends automated email notifications on assignment or status change.
+ * 4. STRICT ISOLATION: The "Email Address" field (Requester) is NEVER modified on assignment.
+ * 
+ * TRIGGERS TO SET in Apps Script Dashboard (Triggers -> Add Trigger):
+ *  1. Function: handleSpreadsheetEdit  | Event: On edit (Installable Trigger)
+ *  2. Function: handleFormSubmit       | Event: On form submit (if using Google Forms)
+ */
+
+// ==========================================
+// 1. TICKET ID GENERATOR (ATOMIC & CONCURRENT-SAFE)
+// ==========================================
+function getOrGenerateTicketId(sheet, row, ticketIdCol) {
+  const currentVal = sheet.getRange(row, ticketIdCol).getValue();
+  if (currentVal && String(currentVal).trim() !== "" && !String(currentVal).startsWith("Row ")) {
+    return String(currentVal).trim();
+  }
+
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (e) {
+    console.error("Lock timeout during Ticket ID generation: " + e.message);
+    return `BMS-${Utilities.formatDate(new Date(), "GMT", "yyyyMMdd-HHmmss")}`;
+  }
+
+  try {
+    const props = PropertiesService.getDocumentProperties();
+    let lastNumber = Number(props.getProperty("LAST_TICKET_NUMBER"));
+
+    if (!lastNumber || isNaN(lastNumber)) {
+      lastNumber = 0;
+      const lastRow = sheet.getLastRow();
+      if (lastRow > 1) {
+        const idValues = sheet.getRange(2, ticketIdCol, lastRow - 1, 1).getValues();
+        idValues.forEach(r => {
+          const match = String(r[0]).match(/BMS-(\d+)/i);
+          if (match) {
+            const num = parseInt(match[1], 10);
+            if (num > lastNumber) lastNumber = num;
+          }
+        });
+      }
+    }
+
+    lastNumber += 1;
+    props.setProperty("LAST_TICKET_NUMBER", lastNumber.toString());
+
+    const formattedId = "BMS-" + Utilities.formatString("%05d", lastNumber);
+    sheet.getRange(row, ticketIdCol).setValue(formattedId);
+    SpreadsheetApp.flush();
+
+    return formattedId;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ==========================================
+// 2. FORM SUBMIT HANDLER (Trigger: On form submit)
+// ==========================================
+function handleFormSubmit(e) {
+  if (!e || !e.range) return;
+  const sourceSheet = e.range.getSheet();
+
+  if (!sourceSheet.getName().toLowerCase().includes("form response")) return;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dbSheet = ss.getSheetByName("Tickets");
+  if (!dbSheet) return;
+
+  const formRow = e.range.getRow();
+  const formHeaders = sourceSheet.getRange(1, 1, 1, sourceSheet.getLastColumn()).getValues()[0];
+  const formValues = sourceSheet.getRange(formRow, 1, 1, formHeaders.length).getValues()[0];
+
+  const getFormVal = (colName) => {
+    const idx = formHeaders.findIndex(h => String(h).trim().toLowerCase() === colName.toLowerCase());
+    return (idx >= 0 && formValues[idx] !== undefined) ? formValues[idx] : "";
+  };
+
+  const timestamp    = getFormVal("Timestamp") || new Date();
+  const email        = getFormVal("Email Address"); // Requester Email
+  const siglum       = getFormVal("Siglum");
+  const summary      = getFormVal("Summary") || "(Untitled Request)";
+  const description  = getFormVal("Description");
+  const criticality  = getFormVal("Criticality") || "Medium";
+  const urgency      = getFormVal("Urgency") || "Default";
+  const requestType  = getFormVal("Request type") || "General";
+  const attachFile   = getFormVal("Attach file");
+  const status       = "To Do";
+
+  const dbHeaders = dbSheet.getRange(1, 1, 1, dbSheet.getLastColumn()).getValues()[0];
+  const dbColMap = {};
+  dbHeaders.forEach((h, idx) => {
+    if (h) dbColMap[String(h).trim().toLowerCase()] = idx + 1;
+  });
+
+  const nextDbRow = dbSheet.getLastRow() + 1;
+  const ticketIdCol = dbColMap['ticket id'];
+
+  const ticketId = getOrGenerateTicketId(dbSheet, nextDbRow, ticketIdCol);
+
+  const setDbVal = (colKey, val) => {
+    const col = dbColMap[colKey.toLowerCase()];
+    if (col) dbSheet.getRange(nextDbRow, col).setValue(val);
+  };
+
+  setDbVal("Timestamp", timestamp);
+  setDbVal("Email Address", email); // Saved once on intake
+  setDbVal("Siglum", siglum);
+  setDbVal("Summary", summary);
+  setDbVal("Description", description);
+  setDbVal("Criticality", criticality);
+  setDbVal("Urgency", urgency);
+  setDbVal("Request type", requestType);
+  setDbVal("Attach file", attachFile);
+  setDbVal("Status", status);
+
+  SpreadsheetApp.flush();
+
+  logToTicketHistory(ticketId, "Ticket Created", "(New Ticket)", "Created via Google Form");
+}
+
+// ==========================================
+// 3. EDIT HANDLER (Trigger: On edit)
+// ==========================================
+function handleSpreadsheetEdit(e) {
+  if (!e || !e.range) return;
+
+  const sheet = e.range.getSheet();
+  if (sheet.getName() !== "Tickets") return;
+
+  const row = e.range.getRow();
+  const col = e.range.getColumn();
+
+  if (row <= 1) return; // Ignore header row edits
+
+  // 1. Map columns dynamically
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const colMap = {};
+  headers.forEach((h, idx) => {
+    if (h && typeof h === 'string') {
+      colMap[h.trim().toLowerCase()] = idx + 1;
+    }
+  });
+
+  const ticketIdCol = colMap['ticket id'];
+  if (!ticketIdCol) return;
+
+  // Ensure Ticket ID exists
+  const ticketId = getOrGenerateTicketId(sheet, row, ticketIdCol);
+
+  // If user edited Ticket ID itself, ignore
+  if (col === ticketIdCol) return;
+
+  const editedHeaderName = headers[col - 1] ? String(headers[col - 1]).trim() : `Column ${col}`;
+
+  // 2. Fetch row data
+  const rowData = sheet.getRange(row, 1, 1, headers.length).getValues()[0];
+  const getVal = (key) => {
+    const c = colMap[key];
+    return (c && rowData[c - 1] !== undefined && rowData[c - 1] !== null) ? String(rowData[c - 1]).trim() : '';
+  };
+
+  // Requester fields (READ-ONLY)
+  const requesterEmail  = getVal('email address');
+  const summary         = getVal('summary') || '(Untitled Request)';
+  const siglum          = getVal('siglum');
+  const description     = getVal('description') || 'No description provided.';
+  const criticality     = getVal('criticality') || 'Medium';
+  const urgentIndicator = getVal('urgency') || 'Default';
+  const requestType     = getVal('request type') || '-';
+  const status          = getVal('status') || 'To Do';
+
+  // Agent Assignment fields (Column L: "Assignee")
+  const assigneeName    = getVal('assignee') || getVal('assignee name');
+
+  // SAFE LOOKUP: Fetch assignee email strictly from the "Team" tab.
+  // Note: NEVER write this back into the "Email Address" column.
+  const assigneeEmail   = lookupAssigneeEmailFromTeam(sheet.getParent(), assigneeName);
+
+  // Values before and after
+  const oldValue = e.oldValue !== undefined ? String(e.oldValue) : '(Empty)';
+  const newValue = e.value !== undefined ? String(e.value) : String(rowData[col - 1] || '');
+
+  if (oldValue === newValue) return;
+
+  // 3. Log change to the "Ticket History" tab
+  logToTicketHistory(ticketId, editedHeaderName, oldValue, newValue);
+
+  // 4. Send email notifications
+  const STATUS_COL = colMap['status'];
+  const ASSIGNEE_COL = colMap['assignee'] || colMap['assignee name'];
+
+  const isStatusChange = (col === STATUS_COL);
+  const isAssignment   = (col === ASSIGNEE_COL);
+
+  if (isStatusChange || isAssignment) {
+    sendNotificationEmail({
+      ticketId,
+      summary,
+      requesterEmail, // Kept intact
+      siglum,
+      description,
+      criticality,
+      urgentIndicator,
+      requestType,
+      status,
+      assigneeName,
+      assigneeEmail,  // Found from Team tab
+      isStatusChange,
+      isAssignment
+    });
+  }
+}
+
+/**
+ * Searches the "Team" tab for the agent's name and retrieves their email.
+ */
+function lookupAssigneeEmailFromTeam(spreadsheet, assigneeName) {
+  if (!assigneeName) return '';
+  const teamSheet = spreadsheet.getSheetByName("Team");
+  if (!teamSheet || teamSheet.getLastRow() <= 1) return '';
+
+  const teamData = teamSheet.getDataRange().getValues();
+  const teamHeaders = teamData[0].map(h => String(h).trim().toLowerCase());
+
+  const nameIdx = teamHeaders.findIndex(h => h === "assignee name" || h === "assignee");
+  const emailIdx = teamHeaders.findIndex(h => h === "assignee email" || h === "email");
+
+  if (nameIdx === -1 || emailIdx === -1) return '';
+
+  const target = assigneeName.trim().toLowerCase();
+  for (let i = 1; i < teamData.length; i++) {
+    const currentName = String(teamData[i][nameIdx] || '').trim().toLowerCase();
+    if (currentName === target) {
+      return String(teamData[i][emailIdx] || '').trim();
+    }
+  }
+  return '';
+}
+
+// ==========================================
+// 4. AUDIT TRAIL LOGGING
+// ==========================================
+function logToTicketHistory(ticketId, fieldModified, oldValue, newValue) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let historySheet = ss.getSheetByName("Ticket History");
+
+  if (!historySheet || historySheet.getLastRow() === 0) {
+    if (!historySheet) historySheet = ss.insertSheet("Ticket History");
+    historySheet.appendRow(["Timestamp", "Ticket ID", "Field Modified", "Old Value", "New Value", "Modified By"]);
+    historySheet.getRange("A1:F1").setFontWeight("bold").setBackground("#f1f5f9");
+    historySheet.setFrozenRows(1);
+  }
+
+  const user = Session.getActiveUser().getEmail() || "Portal User";
+  const now = new Date();
+
+  historySheet.appendRow([
+    now,
+    ticketId,
+    fieldModified,
+    oldValue,
+    newValue,
+    user
+  ]);
+}
+
+// ==========================================
+// 5. EMAIL NOTIFICATIONS
+// ==========================================
+function sendNotificationEmail(t) {
+  const isUrgent = (t.urgentIndicator || '').toUpperCase().includes('URGENT') ||
+                    (t.criticality || '').toLowerCase() === 'high';
+
+  // Safeguard: Truncate summary in the subject line to prevent "Argument too large: subject"
+  const safeSubjectSummary = (t.summary || 'Support Request').length > 50 
+    ? (t.summary || '').substring(0, 47) + '...' 
+    : (t.summary || 'Support Request');
+
+  const plainTextBody = `Ticket ID: ${t.ticketId}\nStatus: ${t.status}\nAssignee: ${t.assigneeName || 'Unassigned'}\nSummary: ${t.summary}\n\nPlease check the BMS Support dashboard for details.`;
+
+  const detailsTable = `
+    <table style="width: 100%; border-collapse: collapse; margin: 18px 0; font-size: 13px;">
+      <tr style="background-color: #f8fafc;">
+        <td style="padding: 10px 12px; font-weight: 600; width: 32%; border-bottom: 1px solid #e2e8f0; color: #64748b;">Ticket ID:</td>
+        <td style="padding: 10px 12px; border-bottom: 1px solid #e2e8f0; font-weight: 700; color: #4338ca;">${t.ticketId}</td>
+      </tr>
+      <tr>
+        <td style="padding: 10px 12px; font-weight: 600; border-bottom: 1px solid #e2e8f0; color: #64748b;">Summary:</td>
+        <td style="padding: 10px 12px; border-bottom: 1px solid #e2e8f0; font-weight: 600; color: #0f172a;">${t.summary}</td>
+      </tr>
+      <tr style="background-color: #f8fafc;">
+        <td style="padding: 10px 12px; font-weight: 600; border-bottom: 1px solid #e2e8f0; color: #64748b;">Current Status:</td>
+        <td style="padding: 10px 12px; border-bottom: 1px solid #e2e8f0;">
+          <span style="background-color: #e0e7ff; color: #3730a3; padding: 3px 10px; border-radius: 6px; font-weight: 700; font-size: 12px;">${t.status}</span>
+        </td>
+      </tr>
+      <tr>
+        <td style="padding: 10px 12px; font-weight: 600; border-bottom: 1px solid #e2e8f0; color: #64748b;">Priority / Urgency:</td>
+        <td style="padding: 10px 12px; border-bottom: 1px solid #e2e8f0;">
+          ${t.criticality} ${isUrgent ? ' - <strong style="color: #dc2626; background: #fee2e2; padding: 2px 6px; border-radius: 4px;">URGENT</strong>' : ''}
+        </td>
+      </tr>
+      <tr style="background-color: #f8fafc;">
+        <td style="padding: 10px 12px; font-weight: 600; border-bottom: 1px solid #e2e8f0; color: #64748b;">Assigned Agent:</td>
+        <td style="padding: 10px 12px; border-bottom: 1px solid #e2e8f0; color: #0f172a;">
+          ${t.assigneeName ? `${t.assigneeName} (${t.assigneeEmail || 'No email registered'})` : '<em>Currently Unassigned</em>'}
+        </td>
+      </tr>
+      <tr>
+        <td style="padding: 10px 12px; font-weight: 600; vertical-align: top; color: #64748b;">Description:</td>
+        <td style="padding: 10px 12px; white-space: pre-wrap; color: #334155; line-height: 1.5;">${t.description}</td>
+      </tr>
+    </table>
+  `;
+
+  // Status Change -> Email Requester (and CC Assignee)
+  if (t.isStatusChange && t.requesterEmail && t.requesterEmail.includes('@')) {
+    const subject = `[BMS Support] Update on Ticket ${t.ticketId}: [${t.status}]`;
+    let statusMessage = `The status of your request has been updated to: ${t.status}.`;
+    let bannerColor = '#2563eb';
+
+    if (t.status === 'Done') {
+      bannerColor = '#059669';
+      statusMessage = 'Your support request has been completed and marked as Done. If you require further assistance, please reply to this email.';
+    } else if (t.status === 'Validation') {
+      bannerColor = '#d97706';
+      statusMessage = 'Your support request is currently in Validation awaiting verification or user acceptance.';
+    } else if (t.status === 'In Progress') {
+      bannerColor = '#2563eb';
+      statusMessage = 'The BMS Support team has begun active investigation on your request.';
+    }
+
+    const htmlBody = `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b; max-width: 620px; border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden; margin: 0 auto;">
+        <div style="background-color: ${bannerColor}; color: #ffffff; padding: 20px 24px;">
+          <span style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.9; font-weight: 600;">BMS Support Line</span>
+          <h2 style="margin: 4px 0 0 0; font-size: 18px; font-weight: 700; color: #ffffff;">Ticket Status Update</h2>
+        </div>
+        <div style="padding: 24px; font-size: 14px; line-height: 1.6;">
+          <p style="margin-top: 0;">Hello,</p>
+          <p style="color: #334155;">${statusMessage}</p>
+          ${detailsTable}
+          <p style="margin-top: 24px; font-size: 12px; color: #94a3b8; border-top: 1px solid #f1f5f9; padding-top: 14px;">
+            This is an automated notification from the BMS Support Line.
+          </p>
+        </div>
+      </div>
+    `;
+
+    try {
+      const options = { htmlBody };
+      if (t.assigneeEmail && t.assigneeEmail.includes('@') && t.assigneeEmail !== t.requesterEmail) {
+        options.cc = t.assigneeEmail;
+      }
+      GmailApp.sendEmail(t.requesterEmail, subject, plainTextBody, options);
+    } catch (err) {
+      console.error('Failed to email requester: ' + err.message);
+    }
+  }
+
+  // New Assignment -> Email Assignee
+  if (t.isAssignment && t.assigneeEmail && t.assigneeEmail.includes('@')) {
+    const subject = `[BMS Support] New Assignment: ${t.ticketId} - ${safeSubjectSummary}`;
+    const htmlBody = `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1e293b; max-width: 620px; border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden; margin: 0 auto;">
+        <div style="background-color: #4338ca; color: #ffffff; padding: 20px 24px;">
+          <span style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.9; font-weight: 600;">BMS Support Line</span>
+          <h2 style="margin: 4px 0 0 0; font-size: 18px; font-weight: 700; color: #ffffff;">New Ticket Assigned to You</h2>
+        </div>
+        <div style="padding: 24px; font-size: 14px; line-height: 1.6;">
+          <p style="margin-top: 0;">Hello <strong>${t.assigneeName || 'Colleague'}</strong>,</p>
+          <p style="color: #334155;">
+            You have been assigned as the lead agent for ticket <strong style="color: #4338ca;">${t.ticketId}</strong>.
+          </p>
+          ${detailsTable}
+          <p style="margin-top: 24px; font-size: 12px; color: #94a3b8; border-top: 1px solid #f1f5f9; padding-top: 14px;">
+            This is an automated notification from the BMS Support Line.
+          </p>
+        </div>
+      </div>
+    `;
+
+    try {
+      GmailApp.sendEmail(t.assigneeEmail, subject, plainTextBody, { htmlBody });
+      console.log(`Assignment notification email successfully sent to: ${t.assigneeEmail}`);
+    } catch (err) {
+      console.error('Failed to email assignee: ' + err.message);
+    }
+  } else if (t.isAssignment && (!t.assigneeEmail || !t.assigneeEmail.includes('@'))) {
+    console.warn(`Assignee changed to "${t.assigneeName}", but no valid email address was found in the Team tab.`);
+  }
+}
+
+// ==========================================
+// 6. WEB APP HANDLERS
+// ==========================================
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('index')
+    .setTitle('Contact BMS Support Line')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function doPost(e) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const dbSheet = ss.getSheetByName("Tickets");
+    if (!dbSheet) {
+      throw new Error("Target sheet 'Tickets' not found.");
+    }
+
+    let data = e.parameter || {};
+    if (e.postData && e.postData.contents) {
+      try {
+        const parsed = JSON.parse(e.postData.contents);
+        data = Object.assign({}, data, parsed);
+      } catch (jsonErr) {}
+    }
+
+    const timestamp    = new Date();
+    const email        = data.email || Session.getActiveUser().getEmail() || "";
+    const siglum       = data.siglum || "";
+    const summary      = data.summary || "(Untitled Request)";
+    const description  = data.description || "";
+    const criticality  = data.criticality || "Medium";
+    const urgency      = data.urgency || "Default";
+    const requestType  = data.requestType || "General";
+    let attachFile     = "";
+
+    // Map column headers dynamically (case-insensitive)
+    const dbHeaders = dbSheet.getRange(1, 1, 1, dbSheet.getLastColumn()).getValues()[0];
+    const dbColMap = {};
+    dbHeaders.forEach((h, idx) => {
+      if (h) dbColMap[String(h).trim().toLowerCase()] = idx + 1;
+    });
+
+    const nextDbRow = dbSheet.getLastRow() + 1;
+    const ticketIdCol = dbColMap['ticket id'];
+
+    // Generate atomic Ticket ID first
+    const ticketId = getOrGenerateTicketId(dbSheet, nextDbRow, ticketIdCol);
+
+    // File upload handling: Ticket ID prefixing & BMS Support Line folder storage
+    if (data.fileData && data.fileName) {
+      const TARGET_FOLDER_ID = "1fkbSxbubmUiWcAbYNldzxKLH0a9CGr0o"; // BMS Support Line folder
+      const folder = DriveApp.getFolderById(TARGET_FOLDER_ID);
+      const contentType = data.fileType || "application/octet-stream";
+      const decodedData = Utilities.base64Decode(data.fileData.split(",")[1]);
+      
+      // Standardize filename: BMS-XXXXX_originalName.ext
+      const sanitizedFileName = ticketId + "_" + data.fileName.replace(/[^a-zA-Z0-9.\-_]/g, "_");
+      const blob = Utilities.newBlob(decodedData, contentType, sanitizedFileName);
+      
+      const file = folder.createFile(blob);
+      attachFile = file.getUrl();
+    }
+
+    const setDbVal = (colKey, val) => {
+      const col = dbColMap[colKey.toLowerCase()];
+      if (col) dbSheet.getRange(nextDbRow, col).setValue(val);
+    };
+
+    setDbVal("Timestamp", timestamp);
+    setDbVal("Email Address", email);
+    setDbVal("Siglum", siglum);
+    setDbVal("Summary", summary);
+    setDbVal("Description", description);
+    setDbVal("Criticality", criticality);
+    setDbVal("Urgency", urgency);
+    setDbVal("Request type", requestType);
+    setDbVal("Attach file", attachFile);
+    setDbVal("Status", "To Do");
+
+    SpreadsheetApp.flush();
+
+    logToTicketHistory(ticketId, "Ticket Created", "(New Ticket)", "Created via HTML Form");
+
+    return ContentService.createTextOutput(JSON.stringify({ result: "success", ticketId: ticketId }))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (error) {
+    console.error("doPost error: " + error.toString());
+    return ContentService.createTextOutput(JSON.stringify({ result: "error", error: error.toString() }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+/**
+ * Processes form submissions originating directly from the HTML Web App UI via google.script.run.
+ */
+function processHtmlFormSubmission(payload) {
+  const fakeEvent = { parameter: payload };
+  const resultText = doPost(fakeEvent).getContent();
+  return JSON.parse(resultText);
+}
+
+/**
+ * Gets the email address of the currently signed-in Google user.
+ */
+function getUserEmail() {
+  return Session.getActiveUser().getEmail() || Session.getEffectiveUser().getEmail() || "";
+}
+
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BMS Support Line - Submit Request</title>
+  <style>
+    :root {
+      --primary: #0052cc;
+      --primary-hover: #003d99;
+      --bg-color: #f1f5f9;
+      --card-bg: #ffffff;
+      --text-main: #0f172a;
+      --text-muted: #64748b;
+      --border-color: #cbd5e1;
+      --border-focus: #3b82f6;
+      --radius: 10px;
+      --shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.08), 0 8px 10px -6px rgba(15, 23, 42, 0.04);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background-color: var(--bg-color);
+      color: var(--text-main);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 40px 16px;
+    }
+
+    .form-card {
+      width: 100%;
+      max-width: 680px;
+      background: var(--card-bg);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      border: 1px solid #e2e8f0;
+    }
+
+    .card-header {
+      background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+      color: #ffffff;
+      padding: 32px 36px;
+      border-bottom: 4px solid var(--primary);
+    }
+
+    .card-header .brand-badge {
+      display: inline-block;
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      background: rgba(255, 255, 255, 0.12);
+      padding: 4px 10px;
+      border-radius: 20px;
+      margin-bottom: 12px;
+      color: #38bdf8;
+    }
+
+    .card-header h2 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 6px;
+    }
+
+    .card-header p {
+      font-size: 0.92rem;
+      color: #94a3b8;
+      line-height: 1.4;
+    }
+
+    form {
+      padding: 32px 36px;
+    }
+
+    .form-group {
+      margin-bottom: 22px;
+    }
+
+    label {
+      display: block;
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #334155;
+      margin-bottom: 6px;
+      letter-spacing: 0.01em;
+    }
+
+    label .required-star {
+      color: #ef4444;
+      margin-left: 2px;
+    }
+
+    input[type="text"],
+    input[type="email"],
+    select,
+    textarea {
+      width: 100%;
+      padding: 12px 14px;
+      font-size: 0.95rem;
+      color: var(--text-main);
+      background-color: #f8fafc;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      transition: all 0.2s ease-in-out;
+      outline: none;
+      font-family: inherit;
+    }
+
+    input[type="text"]:focus,
+    input[type="email"]:focus,
+    select:focus,
+    textarea:focus {
+      background-color: #ffffff;
+      border-color: var(--border-focus);
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+    }
+
+    input[readonly] {
+      background-color: #e2e8f0;
+      color: #475569;
+      cursor: not-allowed;
+      border-color: #cbd5e1;
+    }
+
+    textarea {
+      resize: vertical;
+      min-height: 110px;
+      line-height: 1.5;
+    }
+
+    select {
+      appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%2364748b'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'%3E%3C/path%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 14px center;
+      background-size: 16px;
+      padding-right: 40px;
+    }
+
+    .row {
+      display: flex;
+      gap: 16px;
+    }
+
+    .row .form-group {
+      flex: 1;
+    }
+
+    /* Custom File Input Styling */
+    .file-dropzone {
+      position: relative;
+      border: 2px dashed #cbd5e1;
+      border-radius: 6px;
+      padding: 18px;
+      text-align: center;
+      background-color: #f8fafc;
+      transition: border-color 0.2s, background-color 0.2s;
+      cursor: pointer;
+    }
+
+    .file-dropzone:hover {
+      border-color: var(--primary);
+      background-color: #f0f7ff;
+    }
+
+    .file-dropzone input[type="file"] {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      opacity: 0;
+      cursor: pointer;
+    }
+
+    .file-dropzone-text {
+      font-size: 0.88rem;
+      color: var(--text-muted);
+    }
+
+    .file-dropzone-text strong {
+      color: var(--primary);
+    }
+
+    .file-name-display {
+      margin-top: 6px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: #0284c7;
+    }
+
+    button[type="submit"] {
+      background-color: var(--primary);
+      color: #ffffff;
+      border: none;
+      width: 100%;
+      padding: 14px 20px;
+      font-size: 1rem;
+      font-weight: 600;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background-color 0.2s, transform 0.1s;
+      box-shadow: 0 4px 12px rgba(0, 82, 204, 0.25);
+      margin-top: 10px;
+    }
+
+    button[type="submit"]:hover {
+      background-color: var(--primary-hover);
+    }
+
+    button[type="submit"]:active {
+      transform: scale(0.99);
+    }
+
+    button[type="submit"]:disabled {
+      background-color: #94a3b8;
+      box-shadow: none;
+      cursor: not-allowed;
+    }
+
+    /* Alert / Status Messages */
+    .status-message {
+      margin-top: 20px;
+      padding: 14px 18px;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      font-weight: 500;
+      display: none;
+      line-height: 1.4;
+    }
+
+    .status-success {
+      background-color: #f0fdf4;
+      border: 1px solid #bbf7d0;
+      color: #166534;
+    }
+
+    .status-error {
+      background-color: #fef2f2;
+      border: 1px solid #fecaca;
+      color: #991b1b;
+    }
+
+    @media (max-width: 580px) {
+      .row {
+        flex-direction: column;
+        gap: 0;
+      }
+      form, .card-header {
+        padding: 24px 20px;
+      }
+    }
+  </style>
+</head>
+<body>
+
+<div class="form-card">
+  <div class="card-header">
+    <span class="brand-badge">BMS Support Line</span>
+    <h2>Contact us</h2>
+    <p>Submit your inquiry directly to the BMS Support Line team.</p>
+  </div>
+
+  <form id="bmsForm">
+    <!-- Side-by-Side Row for Requester Email and Siglum -->
+    <div class="row">
+      <div class="form-group">
+        <label for="email">Requester Email <span class="required-star">*</span></label>
+        <input type="email" id="email" name="email" required readonly placeholder="Fetching your email address...">
+      </div>
+
+      <div class="form-group">
+        <label for="siglum">Siglum</label>
+        <input type="text" id="siglum" name="siglum" placeholder="e.g. TXQB">
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label for="summary">Summary <span class="required-star">*</span></label>
+      <input type="text" id="summary" name="summary" required placeholder="Brief overview of your request">
+    </div>
+
+    <div class="form-group">
+      <label for="description">Description</label>
+      <textarea id="description" name="description" placeholder="Provide full details and context"></textarea>
+    </div>
+
+    <div class="row">
+      <div class="form-group">
+        <label for="criticality">Criticality</label>
+        <select id="criticality" name="criticality">
+          <option value="" selected>None</option>
+          <option value="Low">Low</option>
+          <option value="Medium">Medium</option>
+          <option value="High">High</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label for="urgency">Urgency</label>
+        <select id="urgency" name="urgency">
+          <option value="" selected>None</option>
+          <option value="Default">Default</option>
+          <option value="URGENT">URGENT</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label for="requestType">Request Type</label>
+      <select id="requestType" name="requestType">
+        <option value="" selected>None</option>
+        <option value="Action on metadata">Action on metadata</option>
+        <option value="BMS assistant">BMS assistant</option>
+        <option value="Improvement proposal">Improvement proposal</option>
+        <option value="Nomination letter">Nomination letter</option>
+        <option value="Raise incident / update">Raise incident / update</option>
+        <option value="Request information">Request information</option>
+        <option value="BMS tool (Qlik sense, ARIS, DOXIS, ADBRM)">BMS tool (Qlik sense, ARIS, DOXIS, ADBRM)</option>
+      </select>
+    </div>
+
+    <div class="form-group">
+      <label for="attachFile">Attach Attachment (Optional)</label>
+      <div class="file-dropzone">
+        <input type="file" id="attachFile" onchange="updateFileName(this)">
+        <div class="file-dropzone-text">
+          <strong>Click to upload</strong> or drag and drop a file here
+        </div>
+        <div id="fileNameDisplay" class="file-name-display"></div>
+      </div>
+    </div>
+
+    <button type="submit" id="submitBtn">Submit Support Request</button>
+  </form>
+
+  <div id="statusMessage" class="status-message"></div>
+</div>
+
+<script>
+  // Autofill user email on page load from Google Apps Script session
+  window.addEventListener('DOMContentLoaded', () => {
+    google.script.run
+      .withSuccessHandler(email => {
+        if (email) {
+          const emailInput = document.getElementById('email');
+          emailInput.value = email;
+        }
+      })
+      .getUserEmail();
+  });
+
+  function updateFileName(input) {
+    const display = document.getElementById('fileNameDisplay');
+    if (input.files && input.files.length > 0) {
+      display.innerText = "Selected: " + input.files[0].name;
+    } else {
+      display.innerText = "";
+    }
+  }
+
+  document.getElementById('bmsForm').addEventListener('submit', async function(e) {
+    e.preventDefault();
+
+    const submitBtn = document.getElementById('submitBtn');
+    const statusMsg = document.getElementById('statusMessage');
+    submitBtn.disabled = true;
+    submitBtn.innerText = "Submitting Request...";
+    statusMsg.style.display = "none";
+
+    const payload = {
+      email: document.getElementById('email').value,
+      siglum: document.getElementById('siglum').value,
+      summary: document.getElementById('summary').value,
+      description: document.getElementById('description').value,
+      criticality: document.getElementById('criticality').value,
+      urgency: document.getElementById('urgency').value,
+      requestType: document.getElementById('requestType').value
+    };
+
+    const fileInput = document.getElementById('attachFile');
+    if (fileInput.files.length > 0) {
+      const file = fileInput.files[0];
+      payload.fileData = await convertToBase64(file);
+      payload.fileName = file.name;
+      payload.fileType = file.type;
+    }
+
+    google.script.run
+      .withSuccessHandler(response => {
+        submitBtn.disabled = false;
+        submitBtn.innerText = "Submit Support Request";
+        statusMsg.className = "status-message status-success";
+        statusMsg.innerText = "✓ Thank you! Your ticket (" + (response.ticketId || "") + ") has been logged successfully.";
+        statusMsg.style.display = "block";
+        document.getElementById('bmsForm').reset();
+        document.getElementById('fileNameDisplay').innerText = "";
+      })
+      .withFailureHandler(err => {
+        submitBtn.disabled = false;
+        submitBtn.innerText = "Submit Support Request";
+        statusMsg.className = "status-message status-error";
+        statusMsg.innerText = "✕ Submission failed: " + err.message;
+        statusMsg.style.display = "block";
+      })
+      .processHtmlFormSubmission(payload);
+  });
+
+  function convertToBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = error => reject(error);
+    });
+  }
+</script>
+
+</body>
+</html>
