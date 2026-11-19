@@ -1,24 +1,15 @@
-"Act as an internal aerospace quality auditor assistant.
-
-Based on the Non Conformity (NC) description provided between ** **, identify the affected EN9100 chapter(s) / sub-chapter(s). Do not speculate on root causes and do not over-interpret.
-
-Output rules:
-
-Always answer in English. 
-EN9100 Chapter: the clause number and title from the reference list.
-Justification: a short, concise, and factual explanation.
-Provide at most 3 chapters
-Sort rows by relevance (most relevant first).
-Strictly no conversational filler, introduction, or conclusion.
-List of reference chapters: 4.1 Understanding the organization and its context 4.2 Understanding the needs and expectations of interested parties 4.3 Determining the scope of the quality management system 4.4 Quality management system and its processes 5.1.1 General (Leadership and commitment) 5.1.2 Customer focus 5.2.1 Establishing the quality policy 5.2.2 Communicating the quality policy 5.3 Organizational roles responsibilities and authorities 6.1 Actions to address risks and opportunities 6.2 Quality objectives and planning to achieve them 6.3 Planning of changes 7.1.1 General (Resources) 7.1.2 People 7.1.3 Infrastructure 7.1.4 Environment for the operation of processes 7.1.5.1 General (Monitoring and measuring resources) 7.1.5.2 Measurement traceability 7.1.6 Organizational knowledge 7.2 Competence 7.3 Awareness 7.4 Communication 7.5.1 General (Documented information) 7.5.2 Creating and updating 7.5.3 Control of documented information 8.1 Operational planning and control 8.1.1 Operational risk management 8.1.2 Configuration management 8.1.3 Product safety 8.1.4 Prevention of counterfeit parts 8.2.1 Customer communication 8.2.2 Determining the requirements for products and services 8.2.3 Review of the requirements for products and services 8.2.4 Changes to requirements for products and services 8.3.1 General (Design and development of products and services) 8.3.2 Design and development planning 8.3.3 Design and development inputs 8.3.4 Design and development controls 8.3.5 Design and development outputs 8.3.6 Design and development changes 8.4.1 General (Control of externally provided processes products and services) 8.4.2 Type and extent of control 8.4.3 Information for external providers 8.5.1 Control of production and service provision 8.5.1.1 Control of equipment tools and software programs 8.5.1.2 Validation and control of special processes 8.5.1.3 Production process verification 8.5.2 Identification and traceability 8.5.3 Property belonging to customers or external providers 8.5.4 Preservation 8.5.5 Post-delivery activities 8.5.6 Control of changes 8.6 Release of products and services 8.7 Control of nonconforming outputs 9.1.1 General (Monitoring measurement analysis and evaluation) 9.1.2 Customer satisfaction 9.1.3 Analysis and evaluation 9.2 Internal audit 9.3.1 General (Management review) 9.3.2 Management review inputs 9.3.3 Management review outputs 10.1 General (Improvement) 10.2 Nonconformity and corrective action 10.3 Continual improvement
-**Audit Title : MOE Quality - Finding Description : Minor_NC#3Issue: Audit Excel File “Estado Auditorias” 2024xx/2025xx, files are not updated.Description: According MOE A48-M (Issue 6) Sec. 3.1: the control Audit Excel file must be updated every time any data is modified. It was verified for audit 24-ADS-00042476, the tracking excel file “Estado Auditorias 2025_02_28” was not updated to reflect the status for NC F01_C SAAM; closed on 27 MAY 2025. Additionally, the file “Estado Auditorias 2024_12_19”,  has missing data in the fields “Report Planned” and “Report Completed” which appears incomplete (e.g AD-2024-BQ-049;24-ADS-00033563;AD-2024-BQ-037). This issue affects the monitoring and control of  records accuracy. Evidence:-Audit Report 24-ADS-00042476 NC F01_C SAAM closed on 27 MAY 2025; tracking document dated 25/02/2028 not updated.-Excel file “Estado Auditorias 25_12_17” (AD-2024-BQ-049;24-ADS-00033563;AD-2024-BQ-037).REQ:145.A.10  Documentation and records145.A.95 Findings and ObservationsMOE A48-M (sec 3.1)APL: Joaquin Blas Obispo **"
-
-
-reponse : "EN9100 Chapter: 7.5.3 Control of documented information
-Justification: The audit tracking files are not being updated to reflect actual status changes and contain incomplete data, failing to ensure the control and accuracy of documented information.
-
-EN9100 Chapter: 9.2 Internal audit
-Justification: The failure to maintain accurate tracking and status records for audits indicates a breakdown in the management and monitoring of the internal audit process.
-
-EN9100 Chapter: 10.2 Nonconformity and corrective action
-Justification: The discrepancy between the closed NC and the outdated tracking file demonstrates a failure to maintain accurate records following the resolution of nonconformities."
+Voici le guide pas à pas pour construire ton dashboard dans Qlik Sense, en partant du principe que ton script a déjà été chargé avec succès.
+​Étape 1 : Créer le bandeau de filtres réutilisable
+​Au lieu de recréer les filtres sur chaque page, on va les enregistrer en Élément principal (Master Item).
+​1. Ouvre ton application et clique sur Créer une feuille, puis nomme-la 1. Suivi des Audits.
+​2. Clique sur le bouton Éditer la feuille (en haut à droite).
+​3. Dans le menu de gauche, clique sur Graphiques, puis glisse l'objet Volet de filtres tout en haut de ta feuille (étire-le sur toute la largeur, sur 2 ou 3 lignes de hauteur).
+​4. Clique sur Ajouter une dimension dans ce volet et ajoute ces 5 champs un par un :  
+​Lead_Auditor_Project_Atomic (Renomme l'étiquette en Auditeur dans le panneau de droite)  
+​Process_Domain_Final_A (Étiquette : Processus)  
+​Programme_Line_Atomic (Étiquette : Business Unit)  
+​APL_Department_Full_Name (Étiquette : APL)  
+​Audit Year (Étiquette : Année)  
+​5. Pour le réutiliser partout : fais un clic droit sur ce bandeau de filtres → Ajouter aux éléments principaux → nomme-le Filtres Globaux.
+​Étape 2 : Construire la Feuille 1 (Suivi des Audits)
+​Toujours sur ta première feuille (1. Suivi des Audits) :
